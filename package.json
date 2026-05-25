@@ -1,0 +1,18 @@
+{
+  "name": "cc-bot",
+  "version": "0.1.0",
+  "description": "Drive Claude Code from your phone via Telegram. PR-friendly. Strict/Guided/Yolo approval modes.",
+  "type": "module",
+  "main": "src/bot.mjs",
+  "scripts": {
+    "start": "node src/bot.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dustin-olenslager/cc-bot"
+  }
+}

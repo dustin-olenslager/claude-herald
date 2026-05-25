@@ -1,0 +1,23 @@
+services:
+  cc-bot:
+    build: .
+    image: cc-bot:local
+    container_name: cc-bot
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - cc-bot-net
+
+networks:
+  cc-bot-net:
+    name: cc-bot-net
+    driver: bridge
+# To connect your existing claude container to this network:
+#   docker network connect cc-bot-net <your-claude-container>
+# Or add it to your claude container's compose:
+#   networks: [cc-bot-net]
+#   external: true

@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# cc-bot PreToolUse hook
+# Reads tool-call JSON from stdin; asks cc-bot for approval if risky.
+# Exit 0 = allow, exit 2 = block (claude sees stderr as denial reason).
+
+set -euo pipefail
+
+BOT_URL="${CC_BOT_URL:-http://cc-bot:7788}"
+CHAT_ID="${CC_BOT_CHAT_ID:-}"
+MODE="${CC_BOT_MODE:-guided}"
+
+# Read full stdin (the PreToolUse JSON payload)
+PAYLOAD=$(cat)
+
+# Quick exits ---------------------------------------------------------------
+
+# yolo: nothing is gated
+if [ "$MODE" = "yolo" ]; then exit 0; fi
+
+# no chat id: we can't ask anyone — fail open (don't block legitimate non-bot use)
+if [ -z "$CHAT_ID" ]; then exit 0; fi
+
+# Parse JSON (use jq if available, fallback to crude grep)
+if command -v jq >/dev/null 2>&1; then
+  TOOL=$(printf '%s' "$PAYLOAD" | jq -r '.tool_name // empty')
+  CMD=$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.command // empty')
+  CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty')
+  SESSION=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty')
+else
+  TOOL=$(printf '%s' "$PAYLOAD" | grep -oE '"tool_name":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+  CMD=$(printf '%s' "$PAYLOAD" | grep -oE '"command":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+  CWD=""
+  SESSION=""
+fi
+
+# Decide if this tool call needs approval ----------------------------------
+
+needs_approval=0
+
+case "$TOOL" in
+  Bash)
+    # Risky patterns gated in BOTH strict and guided
+    if printf '%s' "$CMD" | grep -qE '(^|[[:space:]])(rm[[:space:]]+-[rfRF]+|rm[[:space:]]+--recursive|rm[[:space:]]+--force)'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE 'git[[:space:]]+push'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE 'git[[:space:]]+reset[[:space:]]+--hard'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE 'git[[:space:]]+clean[[:space:]]+-[fF]'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE 'git[[:space:]]+checkout[[:space:]]+--'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE 'docker[[:space:]]+(compose[[:space:]]+)?(down|rm|kill|stop|prune)'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE '(npm|pnpm|yarn|cargo)[[:space:]]+publish'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE '(^|[[:space:]])(deploy|release)([[:space:]]|$|\.sh)'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qiE 'psql.*(DROP|DELETE|TRUNCATE)'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE 'sudo[[:space:]]'; then needs_approval=1; fi
+    # strict: ALSO any write redirection or curl|bash
+    if [ "$MODE" = "strict" ]; then
+      if printf '%s' "$CMD" | grep -qE '(>|>>)[[:space:]]*[^|]'; then needs_approval=1; fi
+      if printf '%s' "$CMD" | grep -qE 'curl[[:space:]].*\|[[:space:]]*(bash|sh)'; then needs_approval=1; fi
+    fi
+    ;;
+  Edit|Write|MultiEdit|NotebookEdit)
+    if [ "$MODE" = "strict" ]; then needs_approval=1; fi
+    ;;
+esac
+
+if [ "$needs_approval" -eq 0 ]; then exit 0; fi
+
+# Ask the bot --------------------------------------------------------------
+
+REQ_JSON=$(printf '{"chatId":%s,"sessionId":"%s","toolName":"%s","command":%s,"cwd":"%s","mode":"%s"}' \
+  "$CHAT_ID" \
+  "$SESSION" \
+  "$TOOL" \
+  "$(printf '%s' "$CMD" | jq -Rs . 2>/dev/null || printf '"%s"' "$(printf '%s' "$CMD" | sed 's/"/\\"/g')")" \
+  "$CWD" \
+  "$MODE")
+
+HTTP_CODE=$(curl -sS -o /tmp/cc-bot-approval-resp.$$ -w "%{http_code}" \
+  --max-time "$((${APPROVAL_TIMEOUT_SECONDS:-300} + 10))" \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  -d "$REQ_JSON" \
+  "$BOT_URL/approve" 2>/dev/null || echo "000")
+
+REASON=$(cat /tmp/cc-bot-approval-resp.$$ 2>/dev/null || true)
+rm -f /tmp/cc-bot-approval-resp.$$
+
+case "$HTTP_CODE" in
+  200)
+    exit 0
+    ;;
+  403)
+    echo "Denied by user via cc-bot. Reason: ${REASON:-no reason given}" >&2
+    exit 2
+    ;;
+  *)
+    echo "cc-bot approval failed (HTTP $HTTP_CODE). Bot unreachable at $BOT_URL — blocking to be safe. Set CC_BOT_MODE=yolo to bypass." >&2
+    exit 2
+    ;;
+esac
