@@ -331,6 +331,8 @@ async function handleRepo(chatId, arg) {
 
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
+  const kinds = Object.keys(msg).filter((k) => !['message_id','from','chat','date','message_thread_id'].includes(k)).join(',');
+  console.log(`msg from @${msg.from?.username || '?'} chat=${chatId} kinds=[${kinds}]`);
   if (!authorized(msg.from)) {
     console.log(`unauth: @${msg.from?.username || '?'} id=${msg.from?.id}`);
     return;
