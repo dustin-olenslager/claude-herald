@@ -1,5 +1,7 @@
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
 const execFileP = promisify(execFile);
 import * as state from './state.mjs';
 import * as settings from './settings.mjs';
@@ -53,6 +55,53 @@ async function sendChunked(chatId, text, { code = false, markup } = {}) {
       reply_markup: isLast && markup ? markup : undefined,
     });
   }
+}
+
+// ── Image/file handling ───────────────────────────────────────────
+
+const EXT_BY_MIME = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+};
+
+async function downloadTgFile(fileId, ext = '.bin') {
+  const gf = await tg('getFile', { file_id: fileId });
+  if (!gf.ok) return { error: gf.description || 'getFile failed' };
+  const tgPath = gf.result.file_path;
+  const url = `https://api.telegram.org/file/bot${TOKEN}/${tgPath}`;
+  const res = await fetch(url);
+  if (!res.ok) return { error: `download ${res.status}` };
+  const buf = Buffer.from(await res.arrayBuffer());
+  const stem = `cc-bot-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;
+  const localPath = `/tmp/${stem}`;
+  fs.writeFileSync(localPath, buf);
+  // Copy into target container at the same path so claude can Read it.
+  try {
+    await execFileP('docker', ['cp', localPath, `${TARGET_CONTAINER}:${localPath}`]);
+    await execFileP('docker', ['exec', '-u', 'root', TARGET_CONTAINER, 'chmod', '644', localPath]);
+  } catch (e) {
+    return { error: `copy to target failed: ${String(e.message).slice(0, 200)}` };
+  } finally {
+    try { fs.unlinkSync(localPath); } catch {}
+  }
+  return { path: localPath, bytes: buf.length };
+}
+
+async function handleImageMessage(msg, fileId, mime, captionOverride) {
+  const chatId = msg.chat.id;
+  if (runningProcs.has(chatId)) {
+    return sendChunked(chatId, '⏳ Task running — image NOT sent. Stop first.', { markup: defaultKeyboard(chatId) });
+  }
+  await tg('sendChatAction', { chat_id: chatId, action: 'upload_photo' });
+  const ext = EXT_BY_MIME[mime] || '.jpg';
+  const { path, bytes, error } = await downloadTgFile(fileId, ext);
+  if (error) return sendChunked(chatId, `⚠️ Image failed: ${error}`);
+  const caption = (captionOverride || msg.caption || '').trim();
+  const userText = caption || 'What do you see in this image? Describe and suggest any action.';
+  const prompt = `[User attached an image. It is available in the target container at ${path} (${bytes} bytes, ${mime}). Use the Read tool on that path to view it.]\n\n${userText}`;
+  await runAndSend(chatId, prompt);
 }
 
 function authorized(from) {
@@ -290,6 +339,21 @@ async function handleMessage(msg) {
     state.get().knownUserId = msg.from.id;
     state.save();
   }
+
+  // Photo: Telegram sends array of resized variants; last is the largest.
+  if (Array.isArray(msg.photo) && msg.photo.length) {
+    const largest = msg.photo[msg.photo.length - 1];
+    return handleImageMessage(msg, largest.file_id, 'image/jpeg');
+  }
+  // Document w/ image mime: user sent image as "file" for full quality.
+  if (msg.document && (msg.document.mime_type || '').startsWith('image/')) {
+    return handleImageMessage(msg, msg.document.file_id, msg.document.mime_type);
+  }
+  // Sticker as image (static webp).
+  if (msg.sticker && !msg.sticker.is_animated && !msg.sticker.is_video) {
+    return handleImageMessage(msg, msg.sticker.file_id, 'image/webp', 'What is this sticker?');
+  }
+
   const text = (msg.text || '').trim();
   if (!text) return;
 
