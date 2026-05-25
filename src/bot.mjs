@@ -19,6 +19,10 @@ const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS || 600000);
 const APPROVAL_PORT = Number(process.env.APPROVAL_PORT) || 7788;
 const HOOK_SRC = process.env.HOOK_SRC || '/app/hooks/pretooluse-gate.sh';
 const HOOK_PATH = process.env.HOOK_PATH || '/usr/local/bin/cc-bot-pretooluse-gate.sh';
+const NOTIFY_HOOK_SRC = process.env.NOTIFY_HOOK_SRC || '/app/hooks/notify-tg.sh';
+const NOTIFY_HOOK_PATH = process.env.NOTIFY_HOOK_PATH || '/usr/local/bin/cc-bot-notify-tg.sh';
+const TMUX_LAUNCHER_SRC = process.env.TMUX_LAUNCHER_SRC || '/app/hooks/cc-tmux.sh';
+const TMUX_LAUNCHER_PATH = process.env.TMUX_LAUNCHER_PATH || '/usr/local/bin/cc-tmux';
 const BOT_URL_FOR_HOOK = process.env.BOT_URL_FOR_HOOK || `http://cc-bot:${APPROVAL_PORT}`;
 
 if (!TOKEN) { console.error('BOT_TOKEN required'); process.exit(1); }
@@ -144,6 +148,34 @@ function approvalKeyboard(requestId) {
   };
 }
 
+function notifyKeyboard(token) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '1', callback_data: `notif:k:1:${token}` },
+        { text: '2', callback_data: `notif:k:2:${token}` },
+        { text: '3', callback_data: `notif:k:3:${token}` },
+      ],
+      [
+        { text: '✏️ Reply', callback_data: `notif:reply:${token}` },
+        { text: '⛔ Esc', callback_data: `notif:esc:${token}` },
+      ],
+    ],
+  };
+}
+
+// Send keystrokes into an interactive Claude session running in tmux inside a container.
+// `text` is appended with Enter unless it's the literal sentinel 'ESC' (sent as Escape key).
+async function sendTmuxKeys(container, target, text) {
+  const args = ['exec', container, 'tmux', 'send-keys', '-t', target];
+  if (text === 'ESC') {
+    args.push('Escape');
+  } else {
+    args.push(text, 'Enter');
+  }
+  await execFileP('docker', args);
+}
+
 // ── Claude invocation ─────────────────────────────────────────────
 
 function runClaude(prompt, chatId) {
@@ -261,6 +293,29 @@ async function runAndSend(chatId, prompt) {
 }
 
 // ── Approval flow ─────────────────────────────────────────────────
+
+// chatId -> { token, container, target, msgId } — set when user taps ✏️ Reply; next msg goes to tmux.
+const replyPending = new Map();
+
+approval.setChatIdResolver(() => state.get().knownUserId);
+
+approval.setNotifyHandler(async ({ token, chatId, message, container, tmuxTarget, cwd }) => {
+  const text = [
+    '🔔 Claude needs you',
+    cwd ? `· ${cwd}` : null,
+    '',
+    (message || '(no message)').slice(0, 3500),
+  ].filter(Boolean).join('\n');
+  const resp = await tg('sendMessage', {
+    chat_id: chatId,
+    text,
+    reply_markup: notifyKeyboard(token),
+    disable_web_page_preview: true,
+  });
+  if (resp?.ok && resp.result?.message_id) {
+    approval.setNotifyMsgId(token, resp.result.message_id);
+  }
+});
 
 approval.setApprovalHandler(async ({ requestId, chatId, toolName, command, cwd, mode }) => {
   const lines = [
@@ -404,6 +459,23 @@ async function handleMessage(msg) {
   if (text === '/prs') return handlePrs(chatId);
   if (text.startsWith('/repo')) return handleRepo(chatId, text.slice(5).trim());
 
+  // If a notify-reply is pending, route this message into the tmux session instead of starting a new claude run.
+  const pendingReply = replyPending.get(chatId);
+  if (pendingReply) {
+    if (text === '/cancel') {
+      replyPending.delete(chatId);
+      return sendChunked(chatId, '↩️ Reply cancelled.', { markup: defaultKeyboard(chatId) });
+    }
+    replyPending.delete(chatId);
+    try {
+      await sendTmuxKeys(pendingReply.container, pendingReply.target, text);
+      approval.deleteNotifyToken(pendingReply.token);
+      return sendChunked(chatId, `✉️ Sent → ${pendingReply.target}`, { markup: defaultKeyboard(chatId) });
+    } catch (e) {
+      return sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`);
+    }
+  }
+
   if (runningProcs.has(chatId)) {
     return sendChunked(chatId, '⏳ Task running — message NOT sent. Stop first.', { markup: defaultKeyboard(chatId) });
   }
@@ -481,6 +553,59 @@ async function handleCallback(cb) {
     if (!handled) await sendChunked(chatId, '(request already closed or timed out)');
     return;
   }
+  if (data.startsWith('notif:')) {
+    const parts = data.split(':');
+    const verb = parts[1];
+    const token = parts[parts.length - 1];
+    const rec = approval.getNotifyToken(token);
+    if (!rec) {
+      await tg('editMessageReplyMarkup', {
+        chat_id: chatId,
+        message_id: cb.message.message_id,
+        reply_markup: { inline_keyboard: [[{ text: '(expired)', callback_data: 'noop' }]] },
+      });
+      return;
+    }
+    if (verb === 'k') {
+      const key = parts[2];
+      try {
+        await sendTmuxKeys(rec.container, rec.target, key);
+        approval.deleteNotifyToken(token);
+        await tg('editMessageReplyMarkup', {
+          chat_id: chatId,
+          message_id: cb.message.message_id,
+          reply_markup: { inline_keyboard: [[{ text: `↳ sent "${key}"`, callback_data: 'noop' }]] },
+        });
+      } catch (e) {
+        await sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`);
+      }
+      return;
+    }
+    if (verb === 'esc') {
+      try {
+        await sendTmuxKeys(rec.container, rec.target, 'ESC');
+        approval.deleteNotifyToken(token);
+        await tg('editMessageReplyMarkup', {
+          chat_id: chatId,
+          message_id: cb.message.message_id,
+          reply_markup: { inline_keyboard: [[{ text: '↳ sent Esc', callback_data: 'noop' }]] },
+        });
+      } catch (e) {
+        await sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`);
+      }
+      return;
+    }
+    if (verb === 'reply') {
+      replyPending.set(chatId, { token, container: rec.container, target: rec.target });
+      await tg('editMessageReplyMarkup', {
+        chat_id: chatId,
+        message_id: cb.message.message_id,
+        reply_markup: { inline_keyboard: [[{ text: '✏️ waiting for your reply…  /cancel to abort', callback_data: 'noop' }]] },
+      });
+      return;
+    }
+    return;
+  }
   if (data.startsWith('pr:view:')) {
     const num = data.split(':')[2];
     return handlePr(chatId, num);
@@ -522,16 +647,34 @@ async function registerCommands() {
   }).catch((e) => console.error('setMyCommands failed:', e));
 }
 
+async function copyAndChmod(src, dst) {
+  await execFileP('docker', ['cp', src, `${TARGET_CONTAINER}:${dst}`]);
+  await execFileP('docker', ['exec', '-u', 'root', TARGET_CONTAINER, 'chmod', '+x', dst]);
+}
+
 async function installHook() {
+  let ok = true;
   try {
-    await execFileP('docker', ['cp', HOOK_SRC, `${TARGET_CONTAINER}:${HOOK_PATH}`]);
-    await execFileP('docker', ['exec', '-u', 'root', TARGET_CONTAINER, 'chmod', '+x', HOOK_PATH]);
+    await copyAndChmod(HOOK_SRC, HOOK_PATH);
     console.log(`hook installed: ${TARGET_CONTAINER}:${HOOK_PATH}`);
-    return true;
   } catch (e) {
-    console.warn(`hook install failed (will retry on first claude run): ${String(e.message).slice(0, 200)}`);
-    return false;
+    console.warn(`pretooluse hook install failed: ${String(e.message).slice(0, 200)}`);
+    ok = false;
   }
+  // Notification hook + tmux launcher are best-effort — interactive-session feature only.
+  try {
+    await copyAndChmod(NOTIFY_HOOK_SRC, NOTIFY_HOOK_PATH);
+    console.log(`notify hook installed: ${TARGET_CONTAINER}:${NOTIFY_HOOK_PATH}`);
+  } catch (e) {
+    console.warn(`notify hook install failed: ${String(e.message).slice(0, 200)}`);
+  }
+  try {
+    await copyAndChmod(TMUX_LAUNCHER_SRC, TMUX_LAUNCHER_PATH);
+    console.log(`tmux launcher installed: ${TARGET_CONTAINER}:${TMUX_LAUNCHER_PATH}`);
+  } catch (e) {
+    console.warn(`tmux launcher install failed: ${String(e.message).slice(0, 200)}`);
+  }
+  return ok;
 }
 
 let hookInstalled = false;

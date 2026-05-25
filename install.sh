@@ -138,7 +138,7 @@ fi
 say ""
 say "${C_DIM}Checking target container for required tools…${C_R}"
 MISSING=()
-for tool in claude curl jq; do
+for tool in claude curl jq tmux; do
   if ! docker exec -u "${TARGET_USER:-cc}" "$TARGET" sh -c "command -v $tool >/dev/null 2>&1"; then
     MISSING+=("$tool")
   fi
@@ -146,7 +146,8 @@ done
 if [ "${#MISSING[@]}" -gt 0 ]; then
   warn "Missing in '$TARGET': ${MISSING[*]}"
   say "  ${C_DIM}— claude: \`npm install -g @anthropic-ai/claude-code\`${C_R}"
-  say "  ${C_DIM}— curl/jq: \`apt-get install -y curl jq\` (or equivalent)${C_R}"
+  say "  ${C_DIM}— curl/jq/tmux: \`apt-get install -y curl jq tmux\` (or equivalent)${C_R}"
+  say "  ${C_DIM}tmux is required only if you want Telegram notifications for interactive sessions.${C_R}"
   say "  ${C_DIM}gh CLI is optional (only needed for /pr commands).${C_R}"
 fi
 
