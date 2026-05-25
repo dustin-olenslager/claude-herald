@@ -137,6 +137,11 @@ export function deleteNotifyToken(token) {
   notifyTokens.delete(token);
 }
 
+export function rewriteNotifyContainer(token, container) {
+  const rec = notifyTokens.get(token);
+  if (rec) rec.container = container;
+}
+
 export function getPending(requestId) { return pending.get(requestId); }
 
 export function listPendingByChat(chatId) {

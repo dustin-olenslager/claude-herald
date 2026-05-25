@@ -167,7 +167,7 @@ function notifyKeyboard(token) {
 // Send keystrokes into an interactive Claude session running in tmux inside a container.
 // `text` is appended with Enter unless it's the literal sentinel 'ESC' (sent as Escape key).
 async function sendTmuxKeys(container, target, text) {
-  const args = ['exec', container, 'tmux', 'send-keys', '-t', target];
+  const args = ['exec', '-u', TARGET_USER, container, 'tmux', 'send-keys', '-t', target];
   if (text === 'ESC') {
     args.push('Escape');
   } else {
@@ -300,6 +300,12 @@ const replyPending = new Map();
 approval.setChatIdResolver(() => state.get().knownUserId);
 
 approval.setNotifyHandler(async ({ token, chatId, message, container, tmuxTarget, cwd }) => {
+  // The hook may have reported its container's hostname (which often != docker container name).
+  // Single-target bot owns the source-of-truth: rewrite token's container to TARGET_CONTAINER so
+  // downstream send-keys hits the right place regardless of what the hook guessed.
+  if (container !== TARGET_CONTAINER) {
+    approval.rewriteNotifyContainer(token, TARGET_CONTAINER);
+  }
   const text = [
     '🔔 Claude needs you',
     cwd ? `· ${cwd}` : null,
