@@ -17,46 +17,59 @@ Claude Code is amazing at the keyboard. But the moments you most want an AI dev 
 - **Summaries by default.** Claude is instructed to TL;DR every reply; full response sits behind a 📖 Details button.
 - **Self-host friendly.** One `docker compose up`. No SaaS, no proxy, your tokens stay yours.
 
-## Quickstart (5 minutes)
+## Quickstart (2 minutes)
 
-### 1. Get a bot token
+```bash
+git clone https://github.com/dustin-olenslager/cc-bot.git
+cd cc-bot
+./install.sh
+```
 
-Open [@BotFather](https://t.me/BotFather) on Telegram → `/newbot` → copy the token.
+The installer:
 
-### 2. Identify yourself
+1. Checks prereqs (docker, docker compose)
+2. Prompts you for a `BOT_TOKEN` (links you to [@BotFather](https://t.me/BotFather))
+3. Prompts for your Telegram `@username`
+4. Lets you pick a default mode (strict/guided/yolo)
+5. Detects your existing Claude container or builds a fresh one from [examples/claude-container.Dockerfile](./examples/claude-container.Dockerfile)
+6. Creates the docker network, wires it up
+7. Builds + starts cc-bot
+8. Prints your bot's `t.me/...` URL
 
-Send any message to your new bot from your account. The bot logs your `user_id` + `username` on first message. Or skip — just put your `@username` in `.env`.
+If the installer builds a fresh Claude container, you'll need to authenticate `claude` once:
+```bash
+docker exec -it -u cc claude-code-rc claude
+# follow the device-flow link in a browser; token persists
+```
 
-### 3. Have a Claude Code container ready
+Then open the printed Telegram link, send `/start`. You're driving.
 
-cc-bot doesn't run Claude itself — it talks to an existing container that has `claude` CLI installed. The container needs:
+### Manual setup (if you don't want the installer)
 
-- `claude` CLI on PATH (npm: `@anthropic-ai/claude-code`)
-- `bash`, `curl`, `jq` for the approval hook
-- Network access to `cc-bot` (same docker network)
-- A logged-in `claude` (run `claude` interactively once to auth, or set `ANTHROPIC_API_KEY`)
-
-The repo includes an [example claude container Dockerfile](./examples/claude-container.Dockerfile).
-
-### 4. Configure + run
+<details>
+<summary>Click to expand</summary>
 
 ```bash
 git clone https://github.com/dustin-olenslager/cc-bot.git
 cd cc-bot
 cp .env.example .env
 # edit .env: BOT_TOKEN, ALLOWED_USERNAME, TARGET_CONTAINER
+
+# create network, connect your existing claude container
+docker network create cc-bot-net
+docker network connect cc-bot-net <your-claude-container-name>
+
 docker compose up -d --build
 ```
 
-### 5. Connect your Claude container to the network
+Target container requirements:
+- `claude` CLI on PATH (`npm install -g @anthropic-ai/claude-code`)
+- `bash`, `curl`, `jq` (for the approval hook)
+- `gh` CLI (optional — needed for `/pr` commands)
+- A logged-in `claude` (run `claude` once for device-flow auth, or set `ANTHROPIC_API_KEY`)
+- Connected to the `cc-bot-net` docker network
 
-```bash
-docker network connect cc-bot-net <your-claude-container-name>
-```
-
-### 6. Say hi
-
-Open your bot in Telegram, send `/start`. You're driving.
+</details>
 
 ## Approval modes — what each does
 
