@@ -15,7 +15,7 @@ services:
 networks:
   cc-bot-net:
     name: cc-bot-net
-    driver: bridge
+    external: true
 # To connect your existing claude container to this network:
 #   docker network connect cc-bot-net <your-claude-container>
 # Or add it to your claude container's compose:
