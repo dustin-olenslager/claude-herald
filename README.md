@@ -16,6 +16,7 @@ Claude Code is amazing at the keyboard. But the moments you most want an AI dev 
 - **Real `/stop`.** Kills the running Claude process. No more waiting 10 minutes for a wrong turn.
 - **Summaries by default.** Claude is instructed to TL;DR every reply; full response sits behind a 📖 Details button.
 - **Self-host friendly.** One `docker compose up`. No SaaS, no proxy, your tokens stay yours.
+- **Telegram for *interactive* sessions too.** Wrap your terminal Claude in tmux and the bot will ping you on Telegram whenever Claude pauses for input — tap a number, hit Esc, or type a free-text reply. Keystrokes are piped straight into the live session.
 
 ## Quickstart (2 minutes)
 
@@ -143,6 +144,68 @@ Buttons under every reply: 📖 Details · ➡️ Continue · 🛑 Stop · 🆕 
 - Hook posts to bot's internal HTTP server. Bot sends inline approval buttons.
 - You tap → bot resolves → hook exits 0 → tool runs.
 
+## Interactive sessions (Telegram-as-input-bridge)
+
+The default flow above is **bot-initiated**: you type in Telegram, the bot spawns a `claude -p` run, you get a reply.
+
+There's a second flow for the case where you **already have Claude open in a terminal** (in tmux on your server) and you walk away. When Claude pauses for input — a permission prompt, an idle wait, anything — the bot pings you on Telegram and lets you respond. Your tap/typing is injected straight into the live tmux pane.
+
+### Setup (one time)
+
+1. Make sure `tmux` is installed inside your target container:
+   ```bash
+   docker exec -u root claude-code-rc apt-get install -y tmux
+   ```
+   (`install.sh` will warn you if it's missing.)
+
+2. Add this to `~/.claude/settings.json` inside the target container (path: `/home/<TARGET_USER>/.claude/settings.json` or wherever your `claude` user's settings live):
+   ```json
+   {
+     "hooks": {
+       "Notification": [
+         { "hooks": [{ "type": "command", "command": "/usr/local/bin/cc-bot-notify-tg.sh" }] }
+       ]
+     }
+   }
+   ```
+   The hook script and the launcher are installed automatically by cc-bot on startup (`docker cp` into the target container).
+
+### Usage
+
+Launch Claude through the supplied tmux wrapper instead of running `claude` directly:
+
+```bash
+cc-tmux            # session name: cc-main
+cc-tmux feature-x  # session name: feature-x
+```
+
+The wrapper sets `CC_TMUX_TARGET` / `CC_TMUX_CONTAINER` env vars so the Notification hook knows where to send keystrokes back. If you skip the wrapper (i.e. just run `claude`), the hook silently no-ops — interactive Telegram notifications won't fire, but nothing breaks.
+
+### What you get in Telegram
+
+When Claude waits for you, you get:
+
+```
+🔔 Claude needs you
+· /workspace/your-repo
+
+<the message Claude is showing — typically a permission prompt or "waiting for input">
+```
+
+…with these buttons:
+
+| Button | Sends to tmux |
+|---|---|
+| `1` / `2` / `3` | the digit + Enter (covers permission menu choices) |
+| `✏️ Reply` | bot waits for your next Telegram message, then sends it + Enter |
+| `⛔ Esc` | sends the Escape key (cancel a Claude prompt) |
+
+Tokens expire after `NOTIFY_TTL_SECONDS` (default: 1h) — taps on stale messages show "(expired)".
+
+### Security note for interactive flow
+
+The buttons execute `docker exec <container> tmux send-keys` against your live session. Anyone who can reach `cc-bot:7788/notify` from inside your docker network can trigger a notify (no auth on the hook endpoint). The Telegram button → send-keys step is gated by your `ALLOWED_USERNAME` / `ALLOWED_USER_ID`, so a leaked notify token alone can't inject text. Threat model is the same as the rest of cc-bot: trusted infra, untrusted humans on the internet.
+
 ## Security
 
 **The approval gate protects against accidents, not a malicious LLM.** If a model decides to bypass the gate via `curl bot:7788/approve` itself, it can — they share the docker network. Threat model is "trusted Claude on personal infra," not "untrusted code in a public sandbox."
@@ -170,6 +233,7 @@ All via `.env`:
 | `APPROVAL_TIMEOUT_SECONDS` | `300` | Approval prompt timeout |
 | `CLAUDE_TIMEOUT_MS` | `600000` | Max time for one Claude turn |
 | `APPROVAL_PORT` | `7788` | Internal HTTP port |
+| `NOTIFY_TTL_SECONDS` | `3600` | How long a pending notify token stays valid |
 
 ## Roadmap (v0.2+)
 
