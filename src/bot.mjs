@@ -15,7 +15,13 @@ const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID ? Number(process.env.ALLOWED
 const TARGET_CONTAINER = process.env.TARGET_CONTAINER || 'claude-code-rc';
 const TARGET_USER = process.env.TARGET_USER || 'cc';
 const TARGET_WORKDIR = process.env.TARGET_WORKDIR || '/workspace';
-const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS || 600000);
+const CLAUDE_TIMEOUT_MS = process.env.CLAUDE_TIMEOUT_MS != null ? Number(process.env.CLAUDE_TIMEOUT_MS) : 600000;
+// Claude Code's own default API request timeout is 600000ms (10 min). A non-login
+// `docker exec` does NOT inherit the target container's interactive-shell env, so these
+// must be passed through explicitly or long turns get killed at 10 min.
+const API_TIMEOUT_MS = process.env.CLAUDE_API_TIMEOUT_MS || '3600000';
+const BASH_DEFAULT_TIMEOUT_MS = process.env.CLAUDE_BASH_DEFAULT_TIMEOUT_MS || '300000';
+const BASH_MAX_TIMEOUT_MS = process.env.CLAUDE_BASH_MAX_TIMEOUT_MS || '3600000';
 const APPROVAL_PORT = Number(process.env.APPROVAL_PORT) || 7788;
 const HOOK_SRC = process.env.HOOK_SRC || '/app/hooks/pretooluse-gate.sh';
 const HOOK_PATH = process.env.HOOK_PATH || '/usr/local/bin/cc-bot-pretooluse-gate.sh';
@@ -223,6 +229,9 @@ function runClaude(prompt, chatId) {
       '-e', `CC_BOT_URL=${BOT_URL_FOR_HOOK}`,
       '-e', `APPROVAL_TIMEOUT_SECONDS=${process.env.APPROVAL_TIMEOUT_SECONDS || 300}`,
       '-e', 'PATH=/home/cc/.npm-global/bin:/usr/local/bin:/usr/bin:/bin',
+      '-e', `API_TIMEOUT_MS=${API_TIMEOUT_MS}`,
+      '-e', `BASH_DEFAULT_TIMEOUT_MS=${BASH_DEFAULT_TIMEOUT_MS}`,
+      '-e', `BASH_MAX_TIMEOUT_MS=${BASH_MAX_TIMEOUT_MS}`,
       TARGET_CONTAINER,
       'claude', ...claudeArgs,
     ];
@@ -234,11 +243,11 @@ function runClaude(prompt, chatId) {
 
     let out = '', err = '';
     let timedOut = false;
-    const killTimer = setTimeout(() => {
+    const killTimer = CLAUDE_TIMEOUT_MS > 0 ? setTimeout(() => {
       timedOut = true;
       child.kill('SIGKILL');
       reject(new Error(`claude timed out after ${CLAUDE_TIMEOUT_MS}ms`));
-    }, CLAUDE_TIMEOUT_MS);
+    }, CLAUDE_TIMEOUT_MS) : null;
 
     child.stdout.on('data', (d) => { out += d.toString(); });
     child.stderr.on('data', (d) => { err += d.toString(); });
