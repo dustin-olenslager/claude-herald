@@ -19,10 +19,13 @@ function readBody(req) {
 
 let onApprovalRequest = null;
 let onNotifyRequest = null;
+let onEvent = null;
 let chatIdResolver = null;
 
 export function setApprovalHandler(fn) { onApprovalRequest = fn; }
 export function setNotifyHandler(fn) { onNotifyRequest = fn; }
+// Fire-and-forget status events from the autonomous supervisor (no interactive token).
+export function setEventHandler(fn) { onEvent = fn; }
 // Optional: fn() → chatId (number). Used when the hook caller can't supply chatId itself.
 export function setChatIdResolver(fn) { chatIdResolver = fn; }
 
@@ -100,6 +103,22 @@ async function handleNotify(req, res) {
   }
 }
 
+// Fire-and-forget status event from the Phalanx supervisor (start/progress/done/blocked).
+// Unlike /notify, this is a plain message — no interactive token/tmux Reply button.
+async function handleEvent(req, res) {
+  let body;
+  try { body = await readBody(req); } catch { res.writeHead(400).end('bad json'); return; }
+  let { chatId } = body;
+  const { event, message, repo } = body;
+  if (!chatId && chatIdResolver) { try { chatId = await chatIdResolver(); } catch {} }
+  if (!chatId) { res.writeHead(400).end('chatId (or resolver) required'); return; }
+  res.writeHead(202, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: true }));
+  if (onEvent) {
+    onEvent({ chatId, event: event || 'info', message: message || '', repo: repo || '' })
+      .catch((e) => console.error('event handler error:', e));
+  }
+}
+
 export function start() {
   const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST') {
@@ -108,6 +127,7 @@ export function start() {
     }
     if (req.url === '/approve') return handleApprove(req, res);
     if (req.url === '/notify') return handleNotify(req, res);
+    if (req.url === '/event') return handleEvent(req, res);
     res.writeHead(404).end('not found');
   });
   server.listen(PORT, '0.0.0.0', () => {
