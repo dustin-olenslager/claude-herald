@@ -30,6 +30,10 @@ const NOTIFY_HOOK_PATH = process.env.NOTIFY_HOOK_PATH || '/usr/local/bin/cc-bot-
 const TMUX_LAUNCHER_SRC = process.env.TMUX_LAUNCHER_SRC || '/app/hooks/cc-tmux.sh';
 const TMUX_LAUNCHER_PATH = process.env.TMUX_LAUNCHER_PATH || '/usr/local/bin/cc-tmux';
 const BOT_URL_FOR_HOOK = process.env.BOT_URL_FOR_HOOK || `http://cc-bot:${APPROVAL_PORT}`;
+// Phalanx no-babysit: when an inline run leaves work unfinished, hand the repo to the
+// detached supervisor to finish across fresh sessions. Disable with PHALANX_AUTOESCALATE=0.
+const AUTO_ESCALATE = process.env.PHALANX_AUTOESCALATE !== '0';
+const SUPERVISORD_PATH = process.env.SUPERVISORD_PATH || '/home/cc/.claude/supervisord.sh';
 
 if (!TOKEN) { console.error('BOT_TOKEN required'); process.exit(1); }
 if (!ALLOWED_USERNAME && !ALLOWED_USER_ID) { console.error('ALLOWED_USERNAME or ALLOWED_USER_ID required'); process.exit(1); }
@@ -184,6 +188,42 @@ async function sendTmuxKeys(container, target, text) {
 
 // ── Claude invocation ─────────────────────────────────────────────
 
+// ── Autonomous supervisor hand-off (Phalanx no-babysit) ───────────
+
+// True if cwd/TASKS.md has at least one open "- [ ]" item in the target container.
+async function repoHasOpenTasks(cwd) {
+  try {
+    await execFileP('docker', ['exec', '-u', TARGET_USER, TARGET_CONTAINER,
+      'bash', '-c', 'grep -Eq "^[[:space:]]*-[[:space:]]*\\[ \\]" "$1"/TASKS.md', '_', cwd]);
+    return true;            // grep -q exit 0 = an open task remains
+  } catch { return false; } // exit 1 (no open tasks) or no TASKS.md
+}
+
+// Launch the detached supervisor in the target container; it relaunches fresh
+// `claude -p "/work"` passes until the backlog is done/BLOCKED, posting status to
+// our /event endpoint (-> Telegram). Idempotent: supervisord refuses a second one.
+async function launchSupervisor(cwd) {
+  await execFileP('docker', ['exec', '-u', TARGET_USER,
+    '-e', `PHALANX_NOTIFY_URL=${BOT_URL_FOR_HOOK}/event`,
+    '-e', 'PATH=/home/cc/.npm-global/bin:/usr/local/bin:/usr/bin:/bin',
+    TARGET_CONTAINER, 'bash', SUPERVISORD_PATH, 'start', '-r', cwd]);
+}
+
+// After an inline run, if work is unfinished (open tasks remain, or it timed out),
+// hand the repo to the supervisor and tell the user. No-op when nothing's pending.
+async function maybeEscalate(chatId, reason) {
+  if (!AUTO_ESCALATE) return false;
+  const cwd = state.getRepo(chatId);
+  if (!(await repoHasOpenTasks(cwd))) return false;
+  try { await launchSupervisor(cwd); }
+  catch (e) { console.error('supervisor launch failed:', e); return false; }
+  await sendChunked(chatId,
+    `🤖 Didn't finish in one pass (${reason}). Handed to the autonomous supervisor — ` +
+    `it'll drive it to done across fresh sessions and message you on progress / done / blocked.`,
+    { markup: defaultKeyboard(chatId) });
+  return true;
+}
+
 function runClaude(prompt, chatId) {
   const sessionId = state.getSession(chatId);
   const model = state.getModel(chatId);
@@ -282,6 +322,7 @@ async function runAndSend(chatId, prompt) {
     const { tldr, details } = splitTldr(body);
     state.setLastResponse(chatId, { tldr, details, model: state.getModel(chatId) });
     await sendChunked(chatId, tldr + costFooter(result, state.getModel(chatId)), { markup: defaultKeyboard(chatId) });
+    await maybeEscalate(chatId, "reached this pass's context limit");
   } catch (e) {
     if (e.message === 'stopped') {
       await sendChunked(chatId, '🛑 Stopped.', { markup: defaultKeyboard(chatId) });
@@ -295,6 +336,7 @@ async function runAndSend(chatId, prompt) {
       else summary = `⚠️ Claude errored. Tap 📖 Details for full trace.`;
       state.setLastResponse(chatId, { tldr: summary, details: full, model: state.getModel(chatId) });
       await sendChunked(chatId, summary, { markup: defaultKeyboard(chatId) });
+      if (full.includes('timed out')) await maybeEscalate(chatId, 'timed out');
     }
   } finally {
     clearInterval(heartbeat);
@@ -307,6 +349,16 @@ async function runAndSend(chatId, prompt) {
 const replyPending = new Map();
 
 approval.setChatIdResolver(() => state.get().knownUserId);
+
+// Phalanx supervisor status events -> plain Telegram message (no Reply button).
+approval.setEventHandler(async ({ chatId, event, message }) => {
+  const icon = { start: '🚀', progress: '⏳', done: '✅', blocked: '⛔' }[event] || '🤖';
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: `${icon} Supervisor: ${event}\n${(message || '').slice(0, 3500)}`,
+    disable_web_page_preview: true,
+  });
+});
 
 approval.setNotifyHandler(async ({ token, chatId, message, container, tmuxTarget, cwd }) => {
   // The hook may have reported its container's hostname (which often != docker container name).
