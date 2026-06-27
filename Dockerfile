@@ -18,6 +18,7 @@ WORKDIR /app
 COPY package.json ./
 COPY src ./src
 COPY hooks ./hooks
+COPY proxy ./proxy
 
 ENV NODE_ENV=production
 CMD ["node", "src/bot.mjs"]

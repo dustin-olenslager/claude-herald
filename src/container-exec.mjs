@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import fs from 'node:fs';
 const execFileP = promisify(execFile);
 
 // All docker exec/cp against the single target container live here, with the
@@ -11,9 +12,11 @@ export function makeContainerExec({ container, user }) {
   const TMUX_TARGET_RE = /^[A-Za-z0-9_.-]+:0\.0$/;
 
   // Copy a host file into the target container at the same path and make it readable.
+  // chmod the host file to 644 BEFORE cp (docker cp preserves mode), so the copied
+  // file is world-readable without a privileged in-container `exec -u root chmod`.
   async function copyFileToContainer(localPath) {
+    try { fs.chmodSync(localPath, 0o644); } catch {}
     await execFileP('docker', ['cp', localPath, `${container}:${localPath}`]);
-    await execFileP('docker', ['exec', '-u', 'root', container, 'chmod', '644', localPath]);
   }
 
   async function copyAndChmod(src, dst) {

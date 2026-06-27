@@ -6,13 +6,50 @@ services:
     restart: unless-stopped
     init: true
     env_file: .env
+    # Outbound docker access goes through the default-deny ACL proxy (ADR 0001),
+    # never the raw socket. This wins over any DOCKER_HOST in .env.
+    environment:
+      DOCKER_HOST: tcp://docker-acl-proxy:2375
+    depends_on:
+      docker-acl-proxy:
+        condition: service_healthy
     volumes:
       - ./data:/data
-      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       herald-net: {}
+      herald-docker: {}
+
+  # Bespoke per-container ACL proxy (proxy/docker-acl-proxy.mjs, same image).
+  # Default-deny: allows ONLY exec/cp/inspect on TARGET_CONTAINER (+ exec-id
+  # start + ping/version). Denies create/start/stop/rm, exec on other containers,
+  # and all image/volume/network/build/swarm/system access. See docs/adr/0001.
+  docker-acl-proxy:
+    image: herald:local
+    build: .
+    container_name: herald-docker-proxy
+    restart: unless-stopped
+    init: true
+    command: ["node", "proxy/docker-acl-proxy.mjs"]
+    environment:
+      TARGET_CONTAINER: ${TARGET_CONTAINER:-claude-code-rc}
+      PROXY_PORT: "2375"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:2375/_ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      herald-docker: {}
 
 networks:
   herald-net:
     name: herald-net
     external: true
+  # Private bridge: only herald + the proxy. internal => no outside container can
+  # reach the proxy's TCP port.
+  herald-docker:
+    name: herald-docker
+    internal: true
