@@ -25,6 +25,29 @@ export function stripAsk(text) {
   return (text || '').replace(/<<ASK>>[\s\S]*?<<END>>/g, '').trim();
 }
 
+// A HARD STOP that the agent reported in prose WITHOUT emitting <<ASK>> — the operator
+// must ALWAYS get a selectable decision, never a text wall. Returns a synthesized
+// one-question ASK item (same {q,opts} shape as parseAsk) or null. Caller only uses it
+// when parseAsk found no explicit block.
+export function hardStopAsk(text) {
+  const t = text || '';
+  const blocked = t.match(/BLOCKED:\s*([^\n]+)/i);
+  if (blocked) {
+    return [{ q: `🛑 Blocked: ${blocked[1].trim().slice(0, 240)}`, opts: ['Unblock & continue', 'Skip, move on', 'Tell me more', 'Stop'] }];
+  }
+  if (/gate \(item 5[a-d]?\)|merge into main blocked|operator sign-?off|needs operator|awaiting your|prod-DB .*gated/i.test(t)) {
+    return [{ q: '🚧 A safety gate / sign-off is blocking. How do you want to proceed?', opts: ['Authorize & continue', 'Open a PR instead', 'Tell me more', 'Stop'] }];
+  }
+  return null;
+}
+
+// Synthesize a selectable decision for a RUN-LEVEL hard stop (timeout / error) that has
+// no agent reply body to scan. Pure: kind drives the option set.
+export function runHardStopAsk(kind) {
+  if (kind === 'timeout') return [{ q: '⏱️ Run timed out before finishing. What now?', opts: ['Resume / continue', 'Tell me more', 'Stop'] }];
+  return [{ q: '⚠️ The run errored before finishing. What now?', opts: ['Retry', 'Tell me more', 'Stop'] }];
+}
+
 // True when a reply ends in a yes/no-style question (not a wh- question), so we offer
 // one-tap ✅/❌ instead of making the operator type back.
 export function detectYesNo(text) {

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { TLDR_INSTRUCTION, splitTldr, costFooter } from './tldr.mjs';
-import { ASK_INSTRUCTION, parseAsk, stripAsk, detectYesNo, askKeyboard, nextAfterAnswer } from './ask-flow.mjs';
+import { ASK_INSTRUCTION, parseAsk, stripAsk, detectYesNo, askKeyboard, nextAfterAnswer, hardStopAsk, runHardStopAsk } from './ask-flow.mjs';
 import { log } from './log.mjs';
 
 // Phalanx PreToolUse safety gates installed in the target container's ~/.claude.
@@ -195,6 +195,13 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
         if (preface) await tg.sendChunked(chatId, preface, { threadId });
         return startAskQueue(chatId, sk, threadId, ask);
       }
+      // Hard stop reported in prose without an explicit <<ASK>> (BLOCKED / gate deny /
+      // sign-off): the operator must ALWAYS get a selectable decision, never a text wall.
+      const hs = hardStopAsk(body);
+      if (hs) {
+        await tg.sendChunked(chatId, tldr, { threadId });
+        return startAskQueue(chatId, sk, threadId, hs);
+      }
       const markup = detectYesNo(tldr) ? questionKeyboard(sk) : defaultKeyboard(sk);
       await tg.sendChunked(chatId, tldr + costFooter(result, state.getModel(sk)), { markup, threadId });
       // No success-path escalation: a normal completed turn must NOT hand the repo to the
@@ -207,13 +214,16 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
         log.error({ sk, chatId, err: String(e?.message || e).slice(0, 500), msg: 'claude run errored' });
         const full = e.message;
         const containerDown = /container .* is not running|No such container/.test(full);
+        const isTimeout = full.includes('timed out');
         let summary;
         if (containerDown) summary = `⚠️ ${TARGET_CONTAINER} not running.`;
-        else if (full.includes('timed out')) summary = `⏱️ Timed out after ${Math.round(deps.CLAUDE_TIMEOUT_MS / 60000)} min.`;
+        else if (isTimeout) summary = `⏱️ Timed out after ${Math.round(deps.CLAUDE_TIMEOUT_MS / 60000)} min.`;
         else summary = `⚠️ Claude errored. Tap 📖 Details for full trace.`;
         state.setLastResponse(sk, { tldr: summary, details: full, model: state.getModel(sk) });
-        await tg.sendChunked(chatId, summary, { markup: defaultKeyboard(sk), threadId });
-        if (full.includes('timed out')) await supervisor.maybeEscalate(chatId, sk, threadId, 'timed out', defaultKeyboard);
+        await tg.sendChunked(chatId, summary, { threadId });
+        // Run-level hard stop → ALWAYS a selectable decision (operator chooses; replaces
+        // the silent auto-escalate, which the no-text-wall rule forbids).
+        return startAskQueue(chatId, sk, threadId, runHardStopAsk(isTimeout ? 'timeout' : 'error'));
       }
     } finally {
       clearInterval(heartbeat);
