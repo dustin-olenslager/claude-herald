@@ -44,5 +44,15 @@ export function makeContainerExec({ container, user }) {
     } catch { return false; } // exit 1 (no open tasks) or no TASKS.md
   }
 
-  return { container, user, copyFileToContainer, copyAndChmod, sendTmuxKeys, repoHasOpenTasks, execFileP };
+  // True if `dir` is an existing directory in the target container. `dir` is passed
+  // as an argv element (never interpolated into the shell) so a hostile path can't
+  // break out of the `test -d` check.
+  async function dirExists(dir) {
+    try {
+      await execFileP('docker', ['exec', '-u', user, container, 'test', '-d', dir]);
+      return true;
+    } catch { return false; }
+  }
+
+  return { container, user, copyFileToContainer, copyAndChmod, sendTmuxKeys, repoHasOpenTasks, dirExists, execFileP };
 }

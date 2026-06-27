@@ -1,5 +1,46 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { log } from './log.mjs';
+
+const FETCH_TIMEOUT_MS = Number(process.env.TG_FETCH_TIMEOUT_MS) || 30000;
+const FETCH_ATTEMPTS = Number(process.env.TG_FETCH_ATTEMPTS) || 3;
+
+// fetch with an AbortController timeout and a small retry. Retries on network
+// errors/timeouts and HTTP 429 (honoring Telegram's retry_after), and on 5xx.
+// Throws after the last attempt so callers can decide what to do.
+async function fetchWithRetry(url, opts = {}, { attempts = FETCH_ATTEMPTS, label = 'fetch' } = {}) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const r = await fetch(url, { ...opts, signal: ctrl.signal });
+      clearTimeout(timer);
+      if ((r.status === 429 || r.status >= 500) && i < attempts) {
+        let wait = 2 ** i; // seconds
+        if (r.status === 429) {
+          const j = await r.clone().json().catch(() => null);
+          const ra = j?.parameters?.retry_after;
+          if (ra) wait = Number(ra);
+        }
+        log.warn({ label, attempt: i, status: r.status, waitS: wait, msg: 'tg fetch retry' });
+        await new Promise((res) => setTimeout(res, wait * 1000));
+        continue;
+      }
+      return r;
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      if (i < attempts) {
+        const wait = 2 ** i;
+        log.warn({ label, attempt: i, err: String(e?.message || e), waitS: wait, msg: 'tg fetch error retry' });
+        await new Promise((res) => setTimeout(res, wait * 1000));
+        continue;
+      }
+    }
+  }
+  throw lastErr || new Error(`${label} failed after ${attempts} attempts`);
+}
 
 // Telegram Bot API surface, bound once to a token at the composition root.
 // `state` and the container-copy helper are injected so this module has no
@@ -8,11 +49,11 @@ export function makeTelegram({ token, state, copyFileToContainer }) {
   const API = `https://api.telegram.org/bot${token}`;
 
   async function tg(method, body) {
-    const r = await fetch(`${API}/${method}`, {
+    const r = await fetchWithRetry(`${API}/${method}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
+    }, { label: `tg:${method}` });
     return r.json();
   }
 
@@ -53,7 +94,9 @@ export function makeTelegram({ token, state, copyFileToContainer }) {
     if (!gf.ok) return { error: gf.description || 'getFile failed' };
     const tgPath = gf.result.file_path;
     const url = `https://api.telegram.org/file/bot${token}/${tgPath}`;
-    const res = await fetch(url);
+    let res;
+    try { res = await fetchWithRetry(url, {}, { label: 'tg:download' }); }
+    catch (e) { return { error: `download failed: ${String(e?.message || e).slice(0, 200)}` }; }
     if (!res.ok) return { error: `download ${res.status}` };
     const buf = Buffer.from(await res.arrayBuffer());
     const stem = `herald-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;

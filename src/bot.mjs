@@ -8,6 +8,7 @@ import { makeHookInstaller } from './hook-installer.mjs';
 import { makeSupervisor } from './supervisor.mjs';
 import { makeRunner } from './runner.mjs';
 import { decode } from './callback-codec.mjs';
+import { log } from './log.mjs';
 
 // ── Config ────────────────────────────────────────────────────────
 const TOKEN = process.env.BOT_TOKEN;
@@ -210,8 +211,18 @@ async function handlePrs(chatId, sk, threadId) {
 
 async function handleRepo(chatId, arg, sk, threadId) {
   if (!arg) return sendChunked(chatId, `Current: ${state.getRepo(sk)}\nUsage: /repo <path>`, { threadId });
-  state.setRepo(sk, arg);
-  return sendChunked(chatId, `Repo → ${arg}`, { markup: defaultKeyboard(sk), threadId });
+  const v = state.validateRepoPath(arg);
+  if (!v.ok) {
+    log.warn({ sk, chatId, repo: arg, reason: v.reason, msg: 'repo path rejected' });
+    return sendChunked(chatId, `⚠️ Rejected: ${v.reason}\nAllowed roots: ${state.repoAllowedRoots().join(', ')}`, { threadId });
+  }
+  if (!(await exec.dirExists(v.path))) {
+    log.warn({ sk, chatId, repo: v.path, reason: 'not a directory in container', msg: 'repo path rejected' });
+    return sendChunked(chatId, `⚠️ Not a directory in ${TARGET_CONTAINER}: ${v.path}`, { threadId });
+  }
+  state.setRepo(sk, v.path);
+  log.info({ sk, chatId, repo: v.path, msg: 'repo set' });
+  return sendChunked(chatId, `Repo → ${v.path}`, { markup: defaultKeyboard(sk), threadId });
 }
 
 // ── Message dispatch ──────────────────────────────────────────────
@@ -503,8 +514,8 @@ async function pollLoop() {
         backoff = 0;
         for (const u of j.result) {
           offset = u.update_id + 1;
-          if (u.message) handleMessage(u.message).catch((e) => console.error('handler:', e));
-          else if (u.callback_query) handleCallback(u.callback_query).catch((e) => console.error('callback:', e));
+          if (u.message) handleMessage(u.message).catch((e) => log.error({ chatId: u.message?.chat?.id, err: String(e?.message || e), msg: 'message handler threw' }));
+          else if (u.callback_query) handleCallback(u.callback_query).catch((e) => log.error({ chatId: u.callback_query?.message?.chat?.id, err: String(e?.message || e), msg: 'callback handler threw' }));
         }
       } else if (j.error_code === 409) {
         // Another poller owns this bot token — duplicate instance. Exit clean so the

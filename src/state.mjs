@@ -85,8 +85,35 @@ export function getRepo(chatId) {
   return state.repos[chatId] || process.env.TARGET_WORKDIR || '/workspace';
 }
 
+// Comma-separated allowed roots; default /workspace. Unsanitized cwd flows into
+// `docker exec -w` and `supervisord -r`, so the path is validated before persist.
+export function repoAllowedRoots() {
+  return (process.env.HERALD_REPO_ROOTS || '/workspace')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+// Pure validator: returns { ok, path } or { ok:false, reason }. Rejects relative
+// paths, '..' traversal, shell metacharacters, and anything outside an allowed root.
+// Filesystem/container existence is checked separately by the caller.
+export function validateRepoPath(raw, roots = repoAllowedRoots()) {
+  const p = String(raw || '').trim();
+  if (!p) return { ok: false, reason: 'empty path' };
+  if (!p.startsWith('/')) return { ok: false, reason: 'must be an absolute path' };
+  if (p.includes('..')) return { ok: false, reason: "must not contain '..'" };
+  if (/[;&|`$(){}<>*?!\\\s'"\n\r]/.test(p)) return { ok: false, reason: 'contains forbidden characters' };
+  const norm = path.posix.normalize(p).replace(/\/+$/, '') || '/';
+  const under = roots.some((r) => {
+    const root = path.posix.normalize(r).replace(/\/+$/, '') || '/';
+    return norm === root || norm.startsWith(root + '/');
+  });
+  if (!under) return { ok: false, reason: `must be under: ${roots.join(', ')}` };
+  return { ok: true, path: norm };
+}
+
 export function setRepo(chatId, repoPath) {
-  state.repos[chatId] = repoPath;
+  const v = validateRepoPath(repoPath);
+  if (!v.ok) throw new Error(`invalid repo path: ${v.reason}`);
+  state.repos[chatId] = v.path;
   save();
 }
 

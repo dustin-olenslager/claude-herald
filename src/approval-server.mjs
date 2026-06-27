@@ -1,5 +1,6 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
+import { log } from './log.mjs';
 
 const TIMEOUT_MS = (Number(process.env.APPROVAL_TIMEOUT_SECONDS) || 300) * 1000;
 const NOTIFY_TTL_MS = (Number(process.env.NOTIFY_TTL_SECONDS) || 3600) * 1000;
@@ -46,6 +47,9 @@ async function handleApprove(req, res) {
     if (settled) return;
     settled = true;
     pending.delete(requestId);
+    const outcome = approved ? 'grant'
+      : (reason && reason.startsWith('timeout')) ? 'timeout-deny' : 'deny';
+    log.info({ requestId, chatId, toolName, outcome, reason: approved ? undefined : reason, msg: 'approval settled' });
     if (approved) {
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ approved: true }));
     } else {
@@ -56,7 +60,7 @@ async function handleApprove(req, res) {
   pending.set(requestId, { resolve: settle, chatId, ts: Date.now(), timer, command, toolName });
   if (onApprovalRequest) {
     onApprovalRequest({ requestId, chatId, toolName, command, cwd, mode, sessionId }).catch((e) => {
-      console.error('approval handler error:', e);
+      log.error({ requestId, chatId, toolName, err: String(e?.message || e), msg: 'approval handler rejected' });
       settle(false, 'bot failed to send approval prompt');
     });
   } else {
@@ -94,7 +98,7 @@ async function handleNotify(req, res) {
   res.writeHead(202, { 'Content-Type': 'application/json' }).end(JSON.stringify({ token }));
   if (onNotifyRequest) {
     onNotifyRequest({ token, chatId, message, sessionId, container, tmuxTarget, cwd }).catch((e) => {
-      console.error('notify handler error:', e);
+      log.error({ token, chatId, container, err: String(e?.message || e), msg: 'notify handler rejected' });
     });
   }
 }
@@ -112,7 +116,7 @@ async function handleEvent(req, res) {
   res.writeHead(202, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: true }));
   if (onEvent) {
     onEvent({ chatId, event: event || 'info', message: message || '', repo: repo || '', thread: thread || '' })
-      .catch((e) => console.error('event handler error:', e));
+      .catch((e) => log.error({ chatId, event: event || 'info', repo: repo || '', err: String(e?.message || e), msg: 'event handler rejected' }));
   }
 }
 

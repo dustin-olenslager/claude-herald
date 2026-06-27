@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { TLDR_INSTRUCTION, splitTldr, costFooter } from './tldr.mjs';
 import { ASK_INSTRUCTION, parseAsk, stripAsk, detectYesNo, askKeyboard, nextAfterAnswer } from './ask-flow.mjs';
+import { log } from './log.mjs';
 
 // Owns the docker-exec `claude -p` pass plus the run-lifecycle Maps:
 //   runningProcs  — sk -> { child, startedAt, stopRequested }
@@ -164,7 +165,7 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
       if (e.message === 'stopped') {
         await tg.sendChunked(chatId, '🛑 Stopped.', { markup: defaultKeyboard(sk), threadId });
       } else {
-        console.error('claude error:', e);
+        log.error({ sk, chatId, err: String(e?.message || e).slice(0, 500), msg: 'claude run errored' });
         const full = e.message;
         const containerDown = /container .* is not running|No such container/.test(full);
         let summary;
