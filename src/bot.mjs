@@ -222,6 +222,57 @@ function notifyKeyboard(token) {
   };
 }
 
+// ── Blocking-decision (ASK) queue ─────────────────────────────────
+// The agent emits <<ASK>>[{q,opts[]}]<<END>> when blocked on the operator; we ask
+// one question at a time with numbered buttons, collect, then resume the session.
+const ASK_INSTRUCTION = `When you are blocked and need the operator to make one or more decisions, end your reply with a single machine-readable block (and a short human summary BEFORE it):
+<<ASK>>
+[{"q":"<question>","opts":["<choice 1>","<choice 2>"]}]
+<<END>>
+One object per decision, 2-4 short opts each. Only emit it when genuinely blocked on the operator.`;
+
+const askQueues = new Map();       // sk -> { items:[{q,opts}], answers:[], idx }
+const askPendingOther = new Map(); // sk -> idx awaiting a typed custom answer
+
+function parseAsk(text) {
+  const m = (text || '').match(/<<ASK>>\s*([\s\S]*?)\s*<<END>>/);
+  if (!m) return null;
+  try {
+    const arr = JSON.parse(m[1]);
+    if (!Array.isArray(arr)) return null;
+    return arr
+      .filter((x) => x && x.q && Array.isArray(x.opts) && x.opts.length)
+      .map((x) => ({ q: String(x.q), opts: x.opts.slice(0, 4).map(String) }));
+  } catch { return null; }
+}
+function stripAsk(text) { return (text || '').replace(/<<ASK>>[\s\S]*?<<END>>/g, '').trim(); }
+
+function askKeyboard(items, idx) {
+  const rows = items[idx].opts.map((o, i) => [{ text: `${i + 1} · ${o}`.slice(0, 60), callback_data: `ask:${idx}:${i}` }]);
+  rows.push([{ text: '✏️ Other', callback_data: `ask:${idx}:x` }]);
+  return { inline_keyboard: rows };
+}
+async function presentAsk(chatId, sk, threadId) {
+  const q = askQueues.get(sk);
+  if (!q) return;
+  const item = q.items[q.idx];
+  await sendChunked(chatId, `❓ Q${q.idx + 1}/${q.items.length}: ${item.q}`, { threadId, markup: askKeyboard(q.items, q.idx) });
+}
+function startAskQueue(chatId, sk, threadId, items) {
+  askQueues.set(sk, { items, answers: [], idx: 0 });
+  return presentAsk(chatId, sk, threadId);
+}
+async function advanceAsk(chatId, sk, threadId) {
+  const q = askQueues.get(sk);
+  if (!q) return;
+  q.idx += 1;
+  if (q.idx < q.items.length) return presentAsk(chatId, sk, threadId);
+  askQueues.delete(sk);
+  const compiled = q.items.map((it, i) => `${i + 1}. ${it.q} → ${q.answers[i]}`).join('\n');
+  await sendChunked(chatId, `Got it:\n${compiled}`, { threadId });
+  return runAndSend(chatId, `My decisions:\n${compiled}`, sk, threadId);
+}
+
 // Send keystrokes into an interactive Claude session running in tmux inside a container.
 // `text` is appended with Enter unless it's the literal sentinel 'ESC' (sent as Escape key).
 async function sendTmuxKeys(container, target, text) {
@@ -250,9 +301,10 @@ async function repoHasOpenTasks(cwd) {
 // Launch the detached supervisor in the target container; it relaunches fresh
 // `claude -p "/work"` passes until the backlog is done/BLOCKED, posting status to
 // our /event endpoint (-> Telegram). Idempotent: supervisord refuses a second one.
-async function launchSupervisor(cwd) {
+async function launchSupervisor(cwd, chatId) {
+  const notifyUrl = `${BOT_URL_FOR_HOOK}/event${chatId ? `?chatId=${chatId}` : ''}`;
   await execFileP('docker', ['exec', '-u', TARGET_USER,
-    '-e', `PHALANX_NOTIFY_URL=${BOT_URL_FOR_HOOK}/event`,
+    '-e', `PHALANX_NOTIFY_URL=${notifyUrl}`,
     '-e', 'PATH=/home/cc/.npm-global/bin:/usr/local/bin:/usr/bin:/bin',
     TARGET_CONTAINER, 'bash', SUPERVISORD_PATH, 'start', '-r', cwd]);
 }
@@ -263,7 +315,7 @@ async function maybeEscalate(chatId, sk, threadId, reason) {
   if (!AUTO_ESCALATE) return false;
   const cwd = state.getRepo(sk);
   if (!(await repoHasOpenTasks(cwd))) return false;
-  try { await launchSupervisor(cwd); }
+  try { await launchSupervisor(cwd, chatId); }
   catch (e) { console.error('supervisor launch failed:', e); return false; }
   await sendChunked(chatId,
     `🤖 Didn't finish in one pass (${reason}). Handed to the autonomous supervisor — ` +
@@ -283,7 +335,7 @@ function runClaude(prompt, chatId, sk, threadId) {
       '-p',
       '--output-format', 'json',
       '--model', model,
-      '--append-system-prompt', TLDR_INSTRUCTION,
+      '--append-system-prompt', `${TLDR_INSTRUCTION}\n\n${ASK_INSTRUCTION}`,
     ];
     if (sessionId) claudeArgs.push('--resume', sessionId);
 
@@ -359,6 +411,7 @@ function runClaude(prompt, chatId, sk, threadId) {
 
 async function runAndSend(chatId, prompt, sk, threadId) {
   await ensureHook();
+  askQueues.delete(sk); askPendingOther.delete(sk);
   await tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' });
   const heartbeat = setInterval(() => {
     tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' }).catch(() => {});
@@ -369,6 +422,12 @@ async function runAndSend(chatId, prompt, sk, threadId) {
     const body = result.result ?? JSON.stringify(result, null, 2);
     const { tldr, details } = splitTldr(body);
     state.setLastResponse(sk, { tldr, details, model: state.getModel(sk) });
+    const ask = parseAsk(body);
+    if (ask && ask.length) {
+      const preface = stripAsk(tldr);
+      if (preface) await sendChunked(chatId, preface, { threadId });
+      return startAskQueue(chatId, sk, threadId, ask);
+    }
     const markup = detectYesNo(tldr) ? questionKeyboard(sk) : defaultKeyboard(sk);
     await sendChunked(chatId, tldr + costFooter(result, state.getModel(sk)), { markup, threadId });
     await maybeEscalate(chatId, sk, threadId, "reached this pass's context limit");
@@ -519,6 +578,8 @@ async function handleMessage(msg) {
     state.get().knownUserId = msg.from.id;
     state.save();
   }
+  // Remember the forum group's chat id so cold-start supervisors can route to topics.
+  if (msg.message_thread_id) state.setForumChatId(chatId);
 
   // Photo: Telegram sends array of resized variants; last is the largest.
   if (Array.isArray(msg.photo) && msg.photo.length) {
@@ -552,6 +613,12 @@ async function handleMessage(msg) {
 
   const text = (msg.text || '').trim();
   if (!text) return;
+  // ASK 'Other': a typed answer for a pending custom decision.
+  if (askPendingOther.has(sk)) {
+    const i = askPendingOther.get(sk); askPendingOther.delete(sk);
+    const q = askQueues.get(sk);
+    if (q) { q.answers[i] = text; return advanceAsk(chatId, sk, threadId); }
+  }
 
   if (text === '/start' || text === '/help') {
     return sendChunked(chatId,
@@ -649,6 +716,23 @@ async function handleCallback(cb) {
       reply_markup: { inline_keyboard: [[{ text: data === 'confirm:y' ? '✅ Yes' : '❌ No', callback_data: 'noop' }]] },
     });
     return runAndSend(chatId, answer, sk, threadId);
+  }
+  if (data.startsWith('ask:')) {
+    const q = askQueues.get(sk);
+    if (!q) return;
+    const [, idxStr, pick] = data.split(':');
+    const idx = Number(idxStr);
+    if (idx !== q.idx) return;
+    if (pick === 'x') {
+      askPendingOther.set(sk, idx);
+      await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: '✏️ type your answer…', callback_data: 'noop' }]] } });
+      return sendChunked(chatId, `Type your answer for Q${idx + 1}.`, { threadId });
+    }
+    const chosen = q.items[idx].opts[Number(pick)];
+    if (chosen == null) return;
+    q.answers[idx] = chosen;
+    await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: `✅ ${chosen}`.slice(0, 60), callback_data: 'noop' }]] } });
+    return advanceAsk(chatId, sk, threadId);
   }
   if (data === 'continue') {
     if (runningProcs.has(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });

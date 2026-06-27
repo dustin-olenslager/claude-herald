@@ -92,3 +92,10 @@ export function setTopic(chatId, name, threadId) {
   state.topics[`${chatId}:${name}`] = threadId;
   save();
 }
+
+// The forum supergroup's chat id (negative), learned from the first topic message.
+// Lets cold-start supervisors route reports to per-repo topics instead of the DM.
+export function getForumChatId() { return state.forumChatId; }
+export function setForumChatId(chatId) {
+  if (state.forumChatId !== chatId) { state.forumChatId = chatId; save(); }
+}

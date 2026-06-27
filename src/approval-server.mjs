@@ -109,6 +109,7 @@ async function handleEvent(req, res) {
   let body;
   try { body = await readBody(req); } catch { res.writeHead(400).end('bad json'); return; }
   let { chatId } = body;
+  if (!chatId) { try { const qc = new URL(req.url, 'http://x').searchParams.get('chatId'); if (qc) chatId = Number(qc) || qc; } catch {} }
   const { event, message, repo, thread } = body;
   if (!chatId && chatIdResolver) { try { chatId = await chatIdResolver(); } catch {} }
   if (!chatId) { res.writeHead(400).end('chatId (or resolver) required'); return; }
@@ -125,9 +126,10 @@ export function start() {
       res.writeHead(405).end('method not allowed');
       return;
     }
-    if (req.url === '/approve') return handleApprove(req, res);
-    if (req.url === '/notify') return handleNotify(req, res);
-    if (req.url === '/event') return handleEvent(req, res);
+    const path = (req.url || '').split('?')[0];
+    if (path === '/approve') return handleApprove(req, res);
+    if (path === '/notify') return handleNotify(req, res);
+    if (path === '/event') return handleEvent(req, res);
     res.writeHead(404).end('not found');
   });
   server.listen(PORT, '0.0.0.0', () => {
