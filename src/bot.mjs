@@ -622,7 +622,7 @@ async function handleMessage(msg) {
 
   if (text === '/start' || text === '/help') {
     return sendChunked(chatId,
-      'cc-bot — Claude Code on Telegram\n\n' +
+      'Claude Code Herald\n\n' +
       'Send any message → runs as `claude -p` in target container. Reply is summary + 📖 Details button.\n\n' +
       'Commands:\n' +
       '/settings — mode (strict/guided/yolo) + model\n' +
@@ -921,7 +921,7 @@ async function ensureHook() {
 
 let offset = 0;
 async function pollLoop() {
-  console.log(`cc-bot up; allowed=@${ALLOWED_USERNAME || ALLOWED_USER_ID} target=${TARGET_CONTAINER} (user=${TARGET_USER})`);
+  console.log(`herald up; allowed=@${ALLOWED_USERNAME || ALLOWED_USER_ID} target=${TARGET_CONTAINER} (user=${TARGET_USER})`);
   registerCommands();
   approval.start();
   ensureHook();
