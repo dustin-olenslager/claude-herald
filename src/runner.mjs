@@ -3,6 +3,13 @@ import { TLDR_INSTRUCTION, splitTldr, costFooter } from './tldr.mjs';
 import { ASK_INSTRUCTION, parseAsk, stripAsk, detectYesNo, askKeyboard, nextAfterAnswer } from './ask-flow.mjs';
 import { log } from './log.mjs';
 
+// Phalanx PreToolUse safety gates installed in the target container's ~/.claude.
+// Herald's `--settings` REPLACES the container's hook set, so unless we re-list these
+// the migration/merge (loop-integrity 5c/5d), secret, pipeline and arch guards silently
+// vanish for Telegram-driven agents. Deny wins across hooks, so they still block even in
+// yolo mode. Override via deps.PHALANX_GATE_FILES (e.g. [] in tests).
+const PHALANX_GATE_FILES = ['pipeline-gate.js', 'effect-ca-gate.js', 'secret-gate.js', 'loop-integrity-gate.js'];
+
 // True when a `claude -p --resume <id>` failed because the session no longer
 // exists — the signal to drop the stored session and start fresh instead of erroring.
 export function isStaleSessionError(message) {
@@ -72,9 +79,19 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
       ];
       if (sessionId) claudeArgs.push('--resume', sessionId);
 
+      const phalanxGates = (deps.PHALANX_GATE_FILES ?? PHALANX_GATE_FILES)
+        .map((f) => ({ type: 'command', command: `node "$HOME/.claude/${f}"` }));
       const hookSettings = {
         hooks: {
-          PreToolUse: [{ matcher: '', hooks: [{ type: 'command', command: deps.HOOK_PATH }] }],
+          PreToolUse: [
+            { matcher: '', hooks: [{ type: 'command', command: deps.HOOK_PATH }] },
+            // Re-attach the phalanx gates Herald's --settings would otherwise drop, on
+            // their own matcher. Without this, Telegram-driven agents bypass 5c/5d and can
+            // merge migration branches / leak secrets unguarded.
+            ...(phalanxGates.length
+              ? [{ matcher: 'Skill|Bash|Edit|Write|MultiEdit|NotebookEdit', hooks: phalanxGates }]
+              : []),
+          ],
         },
       };
       claudeArgs.push('--settings', JSON.stringify(hookSettings));
