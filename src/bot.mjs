@@ -167,6 +167,31 @@ function defaultKeyboard(sk) {
   return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
+// True when a reply ends in a yes/no-style question (not a wh- question), so we offer
+// one-tap ✅/❌ instead of making the operator type back.
+function detectYesNo(text) {
+  const tail = text.slice(-600);
+  const m = tail.match(/([^\n.!?]*\?)\s*(?:\[.*?\])?\s*$/);
+  if (!m) return false;
+  const q = m[1].trim().toLowerCase();
+  return !/^(which|what|how|when|where|who|why)\b/.test(q);
+}
+
+// Yes/No row prepended above the normal controls. Scoped per sk like defaultKeyboard.
+function questionKeyboard(sk) {
+  const base = defaultKeyboard(sk);
+  const baseRows = base?.inline_keyboard ?? [];
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Yes', callback_data: 'confirm:y' },
+        { text: '❌ No', callback_data: 'confirm:n' },
+      ],
+      ...baseRows,
+    ],
+  };
+}
+
 function approvalKeyboard(requestId) {
   return {
     inline_keyboard: [
@@ -344,7 +369,8 @@ async function runAndSend(chatId, prompt, sk, threadId) {
     const body = result.result ?? JSON.stringify(result, null, 2);
     const { tldr, details } = splitTldr(body);
     state.setLastResponse(sk, { tldr, details, model: state.getModel(sk) });
-    await sendChunked(chatId, tldr + costFooter(result, state.getModel(sk)), { markup: defaultKeyboard(sk), threadId });
+    const markup = detectYesNo(tldr) ? questionKeyboard(sk) : defaultKeyboard(sk);
+    await sendChunked(chatId, tldr + costFooter(result, state.getModel(sk)), { markup, threadId });
     await maybeEscalate(chatId, sk, threadId, "reached this pass's context limit");
   } catch (e) {
     if (e.message === 'stopped') {
@@ -503,6 +529,22 @@ async function handleMessage(msg) {
   if (msg.document && (msg.document.mime_type || '').startsWith('image/')) {
     return handleImageMessage(msg, msg.document.file_id, msg.document.mime_type);
   }
+  // Generic (non-image) document: download, copy into target container, hand to Claude.
+  if (msg.document) {
+    if (runningProcs.has(sk)) {
+      return sendChunked(chatId, '⏳ Task running — file NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
+    }
+    const doc = msg.document;
+    const mime = doc.mime_type || 'application/octet-stream';
+    const origName = doc.file_name || 'file';
+    const ext = origName.includes('.') ? origName.slice(origName.lastIndexOf('.')) : '';
+    const { path, bytes, error } = await downloadTgFile(doc.file_id, ext);
+    if (error) return sendChunked(chatId, `⚠️ File download failed: ${error}`, { threadId });
+    const caption = (msg.caption || '').trim();
+    const userText = caption || 'File received. Use it as needed.';
+    const prompt = `[User sent a file. It is available in the target container at ${path} (${bytes} bytes, ${mime}, original name: ${origName}). Use the Read tool or Bash to access it.]\n\n${userText}`;
+    return runAndSend(chatId, prompt, sk, threadId);
+  }
   // Sticker as image (static webp).
   if (msg.sticker && !msg.sticker.is_animated && !msg.sticker.is_video) {
     return handleImageMessage(msg, msg.sticker.file_id, 'image/webp', 'What is this sticker?');
@@ -597,6 +639,16 @@ async function handleCallback(cb) {
     const last = state.getLastResponse(sk);
     if (!last?.details) return sendChunked(chatId, '(no details)', { threadId });
     return sendChunked(chatId, last.details, { markup: defaultKeyboard(sk), threadId });
+  }
+  if (data.startsWith('confirm:')) {
+    if (runningProcs.has(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
+    const answer = data === 'confirm:y' ? 'Yes' : 'No';
+    await tg('editMessageReplyMarkup', {
+      chat_id: chatId,
+      message_id: cb.message.message_id,
+      reply_markup: { inline_keyboard: [[{ text: data === 'confirm:y' ? '✅ Yes' : '❌ No', callback_data: 'noop' }]] },
+    });
+    return runAndSend(chatId, answer, sk, threadId);
   }
   if (data === 'continue') {
     if (runningProcs.has(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
