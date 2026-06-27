@@ -1,0 +1,17 @@
+# Site-local override (copy to docker-compose.override.yml; that file is gitignored).
+#
+# Use this when your target Claude container lives on a DIFFERENT, pre-existing docker
+# network (created outside this project) than herald's own. Attach herald to both so it
+# can reach the target's `docker exec`able endpoint.
+#
+# Replace <your-external-network> with the real network name. Find it with:
+#   docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' <your-claude-container>
+services:
+  herald:
+    networks:
+      herald-net: {}
+      <your-external-network>: {}
+
+networks:
+  <your-external-network>:
+    external: true
