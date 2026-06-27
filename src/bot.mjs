@@ -9,7 +9,7 @@ import { makeSupervisor } from './supervisor.mjs';
 import { makeRunner } from './runner.mjs';
 import { decode } from './callback-codec.mjs';
 import { buildRegistry, matchRepo } from './repo-registry.mjs';
-import { resolveEventThread } from './routing.mjs';
+import { resolveReportTopic } from './routing.mjs';
 import { log } from './log.mjs';
 
 // ── Config ────────────────────────────────────────────────────────
@@ -124,6 +124,7 @@ async function maybeBindRepo(chatId, sk, threadId, text) {
   if (res.kind === 'none') return 'skip';
   if (res.kind === 'match') {
     try { state.setRepo(sk, res.path); } catch { return 'skip'; }
+    state.bindRepoTopic(chatId, threadId, res.path);
     log.info({ sk, chatId, repo: res.path, msg: 'repo auto-bound' });
     await sendChunked(chatId, `📌 This topic → ${res.path.split('/').pop()} (${res.path})`, { threadId });
     return 'bound';
@@ -174,11 +175,17 @@ approval.setEventHandler(async ({ chatId, event, message, repo, thread }) => {
   // A job that started in a known topic carries its numeric thread id -> route
   // straight back to it (NEVER create a second topic). Only a cron / cold-start
   // job with no originating topic name-creates a "<repo>" topic.
-  const route = resolveEventThread({ thread, repo });
+  // Route to: explicit originating thread > the repo's canonical topic > a freshly
+  // created "<repo>" topic (which we then BIND so every later report + any human
+  // message for this repo converges on the one topic).
+  const route = resolveReportTopic({ thread, repo, repoTopic: state.getRepoTopic(chatId, repo) });
   const label = (repo ? repo.split('/').pop() : '').trim();
   let threadId;
-  if (route.kind === 'thread') threadId = route.threadId;
-  else if (route.kind === 'name') threadId = await topicFor(chatId, route.name).catch(() => undefined);
+  if (route.kind === 'thread' || route.kind === 'existing') threadId = route.threadId;
+  else if (route.kind === 'create') {
+    threadId = await topicFor(chatId, route.name).catch(() => undefined);
+    if (threadId) state.bindRepoTopic(chatId, threadId, repo);
+  }
   await tg('sendMessage', {
     chat_id: chatId,
     message_thread_id: threadId || undefined,
@@ -269,6 +276,7 @@ async function handleRepo(chatId, arg, sk, threadId) {
     return sendChunked(chatId, `⚠️ Not a directory in ${TARGET_CONTAINER}: ${v.path}`, { threadId });
   }
   state.setRepo(sk, v.path);
+  state.bindRepoTopic(chatId, threadId, v.path);
   log.info({ sk, chatId, repo: v.path, msg: 'repo set' });
   return sendChunked(chatId, `Repo → ${v.path}`, { markup: defaultKeyboard(sk), threadId });
 }
@@ -486,6 +494,7 @@ async function handleCallback(cb) {
       if (!chosen) return;
       pendingRepoBind.delete(sk);
       try { state.setRepo(sk, chosen); } catch { return sendChunked(chatId, '⚠️ Invalid repo path.', { threadId }); }
+      state.bindRepoTopic(chatId, threadId, chosen);
       log.info({ sk, chatId, repo: chosen, msg: 'repo picked' });
       await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: `📌 ${chosen.split('/').pop()}`, callback_data: 'noop' }]] } });
       if (pend.text) return runAndSend(chatId, pend.text, sk, threadId);

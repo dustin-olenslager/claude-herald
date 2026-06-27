@@ -9,7 +9,8 @@ const DEFAULT_STATE = {
   models: {},         // chatId -> model name
   modes: {},          // chatId -> strict | guided | yolo
   lastResponse: {},   // chatId -> { tldr, details, ts, model }
-  repos: {},          // chatId -> current working repo path
+  repos: {},          // sk (`${chatId}:${threadId}`) -> current working repo path
+  repoTopics: {},     // `${chatId}:${repoPath}` -> canonical topic threadId (reverse of repos)
   topics: {},         // `${chatId}:${name}` -> forum topic message_thread_id (0 = flat / not a forum)
   knownUserId: null,
   hookSecret: null,   // shared secret authing the HTTP boundary (hooks/supervisor/cron)
@@ -114,6 +115,23 @@ export function setRepo(chatId, repoPath) {
   const v = validateRepoPath(repoPath);
   if (!v.ok) throw new Error(`invalid repo path: ${v.reason}`);
   state.repos[chatId] = v.path;
+  save();
+}
+
+// Canonical repo -> topic. Recorded whenever a topic is bound to a repo, so an
+// autonomous/cron job (which has no originating topic) reports into the SAME topic
+// the human uses for that repo instead of spawning a duplicate. undefined = none.
+export function getRepoTopic(chatId, repoPath) {
+  return state.repoTopics[`${chatId}:${repoPath}`];
+}
+
+// Bind a repo to a topic in BOTH directions: repo->topic (for report routing) and
+// topic->repo (so a human entering the topic inherits the working dir). No-op for a
+// flat session (no threadId).
+export function bindRepoTopic(chatId, threadId, repoPath) {
+  if (!threadId || !repoPath) return;
+  state.repoTopics[`${chatId}:${repoPath}`] = threadId;
+  state.repos[`${chatId}:${threadId}`] = repoPath;
   save();
 }
 
