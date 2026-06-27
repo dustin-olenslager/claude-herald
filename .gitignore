@@ -5,3 +5,7 @@ data/
 docker-compose.override.yml
 *.log
 .DS_Store
+TASKS.md
+PROGRESS.md
+.claude-runs/
+.work-off

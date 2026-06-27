@@ -7,6 +7,7 @@ set -euo pipefail
 
 BOT_URL="${HERALD_URL:-http://herald:7788}"
 CHAT_ID="${HERALD_CHAT_ID:-}"
+THREAD="${HERALD_THREAD_ID:-}"
 MODE="${HERALD_MODE:-guided}"
 
 # Read full stdin (the PreToolUse JSON payload)
@@ -71,13 +72,14 @@ if [ "$needs_approval" -eq 0 ]; then exit 0; fi
 
 # Ask the bot --------------------------------------------------------------
 
-REQ_JSON=$(printf '{"chatId":%s,"sessionId":"%s","toolName":"%s","command":%s,"cwd":"%s","mode":"%s"}' \
+REQ_JSON=$(printf '{"chatId":%s,"sessionId":"%s","toolName":"%s","command":%s,"cwd":"%s","mode":"%s","thread":%s}' \
   "$CHAT_ID" \
   "$SESSION" \
   "$TOOL" \
   "$(printf '%s' "$CMD" | jq -Rs . 2>/dev/null || printf '"%s"' "$(printf '%s' "$CMD" | sed 's/"/\\"/g')")" \
   "$CWD" \
-  "$MODE")
+  "$MODE" \
+  "${THREAD:-null}")
 
 HTTP_CODE=$(curl -sS -o /tmp/herald-approval-resp.$$ -w "%{http_code}" \
   --max-time "$((${APPROVAL_TIMEOUT_SECONDS:-300} + 10))" \
