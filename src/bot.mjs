@@ -281,6 +281,42 @@ async function handleRepo(chatId, arg, sk, threadId) {
   return sendChunked(chatId, `Repo → ${v.path}`, { markup: defaultKeyboard(sk), threadId });
 }
 
+// Telegram splits a long paste into several messages that land within ~ms of each
+// other. Without buffering, the first starts a run and the rest hit "task running —
+// NOT sent". Debounce per topic: collect messages, dispatch ONCE after a quiet gap so
+// a split paste becomes a single prompt. Commands (/...) bypass this (handled earlier).
+const COALESCE_MS = Number(process.env.HERALD_COALESCE_MS ?? 2500);
+const msgBuffers = new Map(); // sk -> { texts, timer, chatId, threadId }
+
+function clearBuffer(sk) {
+  const b = msgBuffers.get(sk);
+  if (b?.timer) clearTimeout(b.timer);
+  msgBuffers.delete(sk);
+}
+
+async function dispatchText(chatId, sk, threadId, text) {
+  if (runner.isRunning(sk)) {
+    return sendChunked(chatId, '⏳ Task running — message NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
+  }
+  // Forum topics: bind a sticky repo from plain language before running. 'await' means a
+  // picker was shown — the original message replays once the user taps.
+  if ((await maybeBindRepo(chatId, sk, threadId, text)) === 'await') return;
+  await runAndSend(chatId, text, sk, threadId);
+}
+
+function coalesce(chatId, sk, threadId, text) {
+  let b = msgBuffers.get(sk);
+  if (!b) { b = { texts: [], timer: null }; msgBuffers.set(sk, b); }
+  b.texts.push(text); b.chatId = chatId; b.threadId = threadId;
+  if (b.timer) clearTimeout(b.timer);
+  else tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' }).catch(() => {});
+  b.timer = setTimeout(() => {
+    msgBuffers.delete(sk);
+    dispatchText(chatId, sk, threadId, b.texts.join('\n'))
+      .catch((e) => log.error({ sk, err: String(e?.message || e), msg: 'coalesced dispatch threw' }));
+  }, COALESCE_MS);
+}
+
 // ── Message dispatch ──────────────────────────────────────────────
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
@@ -359,10 +395,11 @@ async function handleMessage(msg) {
   if (text === '/whoami') return sendChunked(chatId, `user_id=${msg.from?.id}\nusername=@${msg.from?.username}`, { threadId });
   if (text === '/settings' || text === '/menu') return handleSettings(chatId, sk, threadId);
   if (text === '/new') {
+    clearBuffer(sk);
     state.clearSession(sk);
     return sendChunked(chatId, '🆕 New session.', { markup: defaultKeyboard(sk), threadId });
   }
-  if (text === '/stop') return handleStop(chatId, sk, threadId);
+  if (text === '/stop') { clearBuffer(sk); return handleStop(chatId, sk, threadId); }
   if (text === '/continue') {
     if (runner.isRunning(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
     if (!state.getSession(sk)) return sendChunked(chatId, 'No session. Send a message to start.', { threadId });
@@ -400,13 +437,8 @@ async function handleMessage(msg) {
     }
   }
 
-  if (runner.isRunning(sk)) {
-    return sendChunked(chatId, '⏳ Task running — message NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
-  }
-  // Forum topics: bind a sticky repo from plain language before running. 'await'
-  // means a picker was shown — the original message replays once the user taps.
-  if ((await maybeBindRepo(chatId, sk, threadId, text)) === 'await') return;
-  await runAndSend(chatId, text, sk, threadId);
+  // Plain prose: buffer + debounce so a split paste coalesces into one run.
+  return coalesce(chatId, sk, threadId, text);
 }
 
 // ── Callback dispatch ─────────────────────────────────────────────

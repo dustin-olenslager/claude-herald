@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAsk, stripAsk, detectYesNo, nextAfterAnswer } from '../src/ask-flow.mjs';
+import { parseAsk, stripAsk, detectYesNo, nextAfterAnswer, hardStopAsk, runHardStopAsk } from '../src/ask-flow.mjs';
 
 test('parseAsk: single valid block', () => {
   const r = parseAsk('summary\n<<ASK>>\n[{"q":"Drop or rename?","opts":["drop","rename"]}]\n<<END>>');
@@ -84,4 +84,26 @@ test('nextAfterAnswer: last question → finish with compiled answers', () => {
 test('nextAfterAnswer: single-question queue finishes immediately', () => {
   const q = { items: [{ q: 'Only?', opts: [] }], answers: ['ok'], idx: 0 };
   assert.deepEqual(nextAfterAnswer(q), { kind: 'finish', compiled: '1. Only? → ok' });
+});
+
+test('hardStopAsk: BLOCKED line → selectable item with reason', () => {
+  const r = hardStopAsk('did some work\nBLOCKED: migration 0021 needs operator apply');
+  assert.equal(r.length, 1);
+  assert.match(r[0].q, /Blocked: migration 0021/);
+  assert.ok(r[0].opts.includes('Unblock & continue') && r[0].opts.includes('Stop'));
+});
+
+test('hardStopAsk: gate/sign-off prose → selectable item', () => {
+  assert.ok(hardStopAsk('merge into main blocked -- needs operator sign-off'));
+  assert.ok(hardStopAsk('gate (item 5d): blocked'));
+});
+
+test('hardStopAsk: normal reply → null', () => {
+  assert.equal(hardStopAsk('All tests pass. Deployed.'), null);
+});
+
+test('runHardStopAsk: timeout vs error option sets', () => {
+  assert.match(runHardStopAsk('timeout')[0].q, /timed out/i);
+  assert.ok(runHardStopAsk('timeout')[0].opts.includes('Resume / continue'));
+  assert.ok(runHardStopAsk('error')[0].opts.includes('Retry'));
 });
