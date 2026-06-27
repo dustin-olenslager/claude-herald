@@ -5,7 +5,8 @@
   "type": "module",
   "main": "src/bot.mjs",
   "scripts": {
-    "start": "node src/bot.mjs"
+    "start": "node src/bot.mjs",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=20"
@@ -13,6 +14,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dustin-olenslager/herald"
+    "url": "https://github.com/dustin-olenslager/claude-herald.git"
   }
 }
