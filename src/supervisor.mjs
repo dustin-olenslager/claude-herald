@@ -8,9 +8,13 @@ export function makeSupervisor({ exec, state, tg, deps }) {
   // Launch the detached supervisor; it relaunches fresh `claude -p "/work"` passes
   // until backlog done/BLOCKED, posting status to our /event endpoint. Idempotent:
   // supervisord refuses a second one.
-  async function launchSupervisor(cwd, chatId) {
-    log.info({ chatId, cwd, msg: 'launchSupervisor attempt' });
-    const notifyUrl = `${BOT_URL_FOR_HOOK}/event${chatId ? `?chatId=${chatId}` : ''}`;
+  async function launchSupervisor(cwd, chatId, threadId) {
+    log.info({ chatId, threadId, cwd, msg: 'launchSupervisor attempt' });
+    const q = new URLSearchParams();
+    if (chatId) q.set('chatId', String(chatId));
+    if (threadId) q.set('thread', String(threadId));
+    const qs = q.toString();
+    const notifyUrl = `${BOT_URL_FOR_HOOK}/event${qs ? `?${qs}` : ''}`;
     await exec.execFileP('docker', ['exec', '-u', exec.user,
       '-e', `PHALANX_NOTIFY_URL=${notifyUrl}`,
       '-e', `PHALANX_NOTIFY_SECRET=${HOOK_SECRET}`,
@@ -25,7 +29,7 @@ export function makeSupervisor({ exec, state, tg, deps }) {
     if (!AUTO_ESCALATE) return false;
     const cwd = state.getRepo(sk);
     if (!(await exec.repoHasOpenTasks(cwd))) return false;
-    try { await launchSupervisor(cwd, chatId); }
+    try { await launchSupervisor(cwd, chatId, threadId); }
     catch (e) {
       log.error({ chatId, cwd, reason, err: String(e?.message || e), msg: 'launchSupervisor failed' });
       await tg.sendChunked(chatId,

@@ -54,5 +54,20 @@ export function makeContainerExec({ container, user }) {
     } catch { return false; }
   }
 
-  return { container, user, copyFileToContainer, copyAndChmod, sendTmuxKeys, repoHasOpenTasks, dirExists, execFileP };
+  // Repo candidates for forum auto-detect: git repos under /workspace (depth<=2)
+  // in the target container plus any paths listed in ~/.claude/.phalanx-repos.
+  // Static script (no interpolation); trailing '/.git' is stripped by the caller.
+  async function listRepoCandidates() {
+    const script =
+      'find /workspace -maxdepth 2 -type d -name .git 2>/dev/null | sed "s:/.git$::"; ' +
+      'f="$HOME/.claude/.phalanx-repos"; [ -f "$f" ] && sed "s/#.*//" "$f" | tr -d "[:blank:]" | grep . || true';
+    try {
+      const { stdout } = await execFileP('docker', ['exec', '-u', user, container, 'bash', '-lc', script]);
+      return [...new Set(
+        stdout.split('\n').map((s) => s.trim().replace(/\/\.git$/, '')).filter(Boolean),
+      )];
+    } catch { return []; }
+  }
+
+  return { container, user, copyFileToContainer, copyAndChmod, sendTmuxKeys, repoHasOpenTasks, dirExists, listRepoCandidates, execFileP };
 }

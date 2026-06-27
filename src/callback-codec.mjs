@@ -27,6 +27,7 @@ export function decode(data) {
     const [, verb, num] = s.split(':');
     return { kind: 'pr', verb, num };
   }
+  if (s.startsWith('repopick:')) return { kind: 'repopick', idx: Number(s.split(':')[1]) };
   return { kind: 'unknown', raw: s };
 }
 
@@ -43,4 +44,5 @@ export const enc = {
   prReview: (num) => `pr:review:${num}`,
   prApprove: (num) => `pr:approve:${num}`,
   prMerge: (num) => `pr:merge:${num}`,
+  repoPick: (i) => `repopick:${i}`,
 };

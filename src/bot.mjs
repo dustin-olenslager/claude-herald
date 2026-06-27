@@ -8,6 +8,8 @@ import { makeHookInstaller } from './hook-installer.mjs';
 import { makeSupervisor } from './supervisor.mjs';
 import { makeRunner } from './runner.mjs';
 import { decode } from './callback-codec.mjs';
+import { buildRegistry, matchRepo } from './repo-registry.mjs';
+import { resolveEventThread } from './routing.mjs';
 import { log } from './log.mjs';
 
 // ── Config ────────────────────────────────────────────────────────
@@ -90,6 +92,47 @@ const { runAndSend, handleStop } = runner;
 // sk -> { token, container, target } — set when user taps ✏️ Reply; next msg goes to tmux.
 const replyPending = new Map();
 
+// ── Forum repo auto-detect ────────────────────────────────────────
+// sk -> { text, paths } — pending repo picker; the original message replays on tap.
+const pendingRepoBind = new Map();
+const REGISTRY_TTL_MS = Number(process.env.REPO_REGISTRY_TTL_MS) || 300000;
+let _registry = null, _registryTs = 0;
+
+async function getRegistry() {
+  const now = Date.now();
+  if (_registry && now - _registryTs < REGISTRY_TTL_MS) return _registry;
+  const paths = await exec.listRepoCandidates().catch(() => []);
+  // Only keep paths the same validator setRepo enforces would accept.
+  _registry = buildRegistry(paths.filter((p) => state.validateRepoPath(p).ok));
+  _registryTs = now;
+  return _registry;
+}
+
+function repoPickerKeyboard(paths) {
+  return { inline_keyboard: paths.slice(0, 8).map((p, i) => [{ text: p.split('/').pop(), callback_data: `repopick:${i}` }]) };
+}
+
+// Infer + bind a sticky repo from plain language. Forum topics only; the General
+// flat session is never auto-bound. Returns 'await' when a picker was sent (caller
+// must NOT run the message yet), else 'bound'/'skip' (caller proceeds normally).
+async function maybeBindRepo(chatId, sk, threadId, text) {
+  if (!threadId) return 'skip';
+  const alreadySet = state.get().repos[sk] !== undefined;
+  const wantsSwitch = /^\s*(switch\s+(to|repo)|use\s+repo)\b/i.test(text);
+  if (alreadySet && !wantsSwitch) return 'skip';
+  const res = matchRepo(text, await getRegistry());
+  if (res.kind === 'none') return 'skip';
+  if (res.kind === 'match') {
+    try { state.setRepo(sk, res.path); } catch { return 'skip'; }
+    log.info({ sk, chatId, repo: res.path, msg: 'repo auto-bound' });
+    await sendChunked(chatId, `📌 This topic → ${res.path.split('/').pop()} (${res.path})`, { threadId });
+    return 'bound';
+  }
+  pendingRepoBind.set(sk, { text, paths: res.paths });
+  await sendChunked(chatId, '📂 Which repo is this topic for?', { threadId, markup: repoPickerKeyboard(res.paths) });
+  return 'await';
+}
+
 function authorized(from) {
   if (!from) return false;
   if (ALLOWED_USER_ID && from.id === ALLOWED_USER_ID) return true;
@@ -128,14 +171,18 @@ approval.setChatIdResolver(() => state.get().knownUserId);
 // Phalanx supervisor status events -> plain Telegram message (no Reply button).
 approval.setEventHandler(async ({ chatId, event, message, repo, thread }) => {
   const icon = { start: '🚀', progress: '⏳', done: '✅', blocked: '⛔' }[event] || '🤖';
-  // Per-job routing key from the notify port: prefer the explicit thread, else the
-  // repo basename. Each job's reports land in their own forum topic (flat fallback).
-  const name = (thread || (repo ? repo.split('/').pop() : '') || '').trim();
-  const threadId = await topicFor(chatId, name).catch(() => undefined);
+  // A job that started in a known topic carries its numeric thread id -> route
+  // straight back to it (NEVER create a second topic). Only a cron / cold-start
+  // job with no originating topic name-creates a "<repo>" topic.
+  const route = resolveEventThread({ thread, repo });
+  const label = (repo ? repo.split('/').pop() : '').trim();
+  let threadId;
+  if (route.kind === 'thread') threadId = route.threadId;
+  else if (route.kind === 'name') threadId = await topicFor(chatId, route.name).catch(() => undefined);
   await tg('sendMessage', {
     chat_id: chatId,
     message_thread_id: threadId || undefined,
-    text: `${icon} ${name ? name + ' — ' : ''}Supervisor: ${event}\n${(message || '').slice(0, 3500)}`,
+    text: `${icon} ${label ? label + ' — ' : ''}Supervisor: ${event}\n${(message || '').slice(0, 3500)}`,
     disable_web_page_preview: true,
   });
 });
@@ -160,7 +207,7 @@ approval.setNotifyHandler(async ({ token, chatId, message, container, tmuxTarget
   });
 });
 
-approval.setApprovalHandler(async ({ requestId, chatId, toolName, command, cwd, mode }) => {
+approval.setApprovalHandler(async ({ requestId, chatId, toolName, command, cwd, mode, thread }) => {
   const lines = [
     `⚠️ Approval needed (${settings.MODE_LABELS[mode] || mode})`,
     '',
@@ -173,6 +220,7 @@ approval.setApprovalHandler(async ({ requestId, chatId, toolName, command, cwd, 
   ].filter(Boolean).join('\n');
   await tg('sendMessage', {
     chat_id: chatId,
+    message_thread_id: Number(thread) || undefined,
     text: lines,
     parse_mode: 'Markdown',
     reply_markup: tgkb.approvalKeyboard(requestId),
@@ -347,6 +395,9 @@ async function handleMessage(msg) {
   if (runner.isRunning(sk)) {
     return sendChunked(chatId, '⏳ Task running — message NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
   }
+  // Forum topics: bind a sticky repo from plain language before running. 'await'
+  // means a picker was shown — the original message replays once the user taps.
+  if ((await maybeBindRepo(chatId, sk, threadId, text)) === 'await') return;
   await runAndSend(chatId, text, sk, threadId);
 }
 
@@ -426,6 +477,18 @@ async function handleCallback(cb) {
         reply_markup: { inline_keyboard: [[{ text: `${status} — request closed`, callback_data: 'noop' }]] },
       });
       if (!handled) await sendChunked(chatId, '(request already closed or timed out)', { threadId });
+      return;
+    }
+    case 'repopick': {
+      const pend = pendingRepoBind.get(sk);
+      if (!pend) return;
+      const chosen = pend.paths[ev.idx];
+      if (!chosen) return;
+      pendingRepoBind.delete(sk);
+      try { state.setRepo(sk, chosen); } catch { return sendChunked(chatId, '⚠️ Invalid repo path.', { threadId }); }
+      log.info({ sk, chatId, repo: chosen, msg: 'repo picked' });
+      await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: `📌 ${chosen.split('/').pop()}`, callback_data: 'noop' }]] } });
+      if (pend.text) return runAndSend(chatId, pend.text, sk, threadId);
       return;
     }
     case 'notif': return handleNotif(ev, cb, chatId, sk, threadId, msgId);

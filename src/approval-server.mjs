@@ -36,7 +36,7 @@ async function handleApprove(req, res) {
     res.writeHead(400).end('bad json');
     return;
   }
-  const { chatId, toolName, command, cwd, mode, sessionId } = body;
+  const { chatId, toolName, command, cwd, mode, sessionId, thread } = body;
   if (!chatId) {
     res.writeHead(400).end('chatId required');
     return;
@@ -59,7 +59,7 @@ async function handleApprove(req, res) {
   const timer = setTimeout(() => settle(false, 'timeout: no response from user'), TIMEOUT_MS);
   pending.set(requestId, { resolve: settle, chatId, ts: Date.now(), timer, command, toolName });
   if (onApprovalRequest) {
-    onApprovalRequest({ requestId, chatId, toolName, command, cwd, mode, sessionId }).catch((e) => {
+    onApprovalRequest({ requestId, chatId, toolName, command, cwd, mode, sessionId, thread }).catch((e) => {
       log.error({ requestId, chatId, toolName, err: String(e?.message || e), msg: 'approval handler rejected' });
       settle(false, 'bot failed to send approval prompt');
     });
@@ -108,9 +108,13 @@ async function handleNotify(req, res) {
 async function handleEvent(req, res) {
   let body;
   try { body = await readBody(req); } catch { res.writeHead(400).end('bad json'); return; }
-  let { chatId } = body;
-  if (!chatId) { try { const qc = new URL(req.url, 'http://x').searchParams.get('chatId'); if (qc) chatId = Number(qc) || qc; } catch {} }
-  const { event, message, repo, thread } = body;
+  let { chatId, thread } = body;
+  try {
+    const qp = new URL(req.url, 'http://x').searchParams;
+    if (!chatId) { const qc = qp.get('chatId'); if (qc) chatId = Number(qc) || qc; }
+    if (thread === undefined || thread === '') { const qt = qp.get('thread'); if (qt) thread = qt; }
+  } catch {}
+  const { event, message, repo } = body;
   if (!chatId && chatIdResolver) { try { chatId = await chatIdResolver(); } catch {} }
   if (!chatId) { res.writeHead(400).end('chatId (or resolver) required'); return; }
   res.writeHead(202, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: true }));
