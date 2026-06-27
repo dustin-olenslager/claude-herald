@@ -20,7 +20,11 @@ let state = { ...DEFAULT_STATE };
 try {
   const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
   state = { ...DEFAULT_STATE, ...raw };
-} catch {}
+} catch (e) {
+  if (e.code !== 'ENOENT') {
+    console.warn(`state load failed (${e.message}); starting from defaults — ${STATE_FILE} NOT overwritten until next save`);
+  }
+}
 
 export function get() {
   return state;
@@ -28,7 +32,9 @@ export function get() {
 
 export function save() {
   fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  const tmp = STATE_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, STATE_FILE);
 }
 
 export function getMode(chatId) {

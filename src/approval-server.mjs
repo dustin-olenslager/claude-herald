@@ -92,10 +92,6 @@ async function handleNotify(req, res) {
   });
   // Fire-and-forget: CC's Notification hook doesn't block on response.
   res.writeHead(202, { 'Content-Type': 'application/json' }).end(JSON.stringify({ token }));
-  // Purge expired tokens lazily.
-  for (const [k, v] of notifyTokens) {
-    if (Date.now() - v.ts > NOTIFY_TTL_MS) notifyTokens.delete(k);
-  }
   if (onNotifyRequest) {
     onNotifyRequest({ token, chatId, message, sessionId, container, tmuxTarget, cwd }).catch((e) => {
       console.error('notify handler error:', e);
@@ -164,8 +160,22 @@ export function respondTo(requestId, approved, reason) {
 }
 
 export function getNotifyToken(token) {
-  return notifyTokens.get(token);
+  const rec = notifyTokens.get(token);
+  if (!rec) return undefined;
+  if (Date.now() - rec.ts > NOTIFY_TTL_MS) {
+    notifyTokens.delete(token);
+    return undefined;
+  }
+  return rec;
 }
+
+// Periodic purge of stale tokens (no longer piggy-backed on handleNotify).
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of notifyTokens) {
+    if (now - v.ts > NOTIFY_TTL_MS) notifyTokens.delete(k);
+  }
+}, 60000).unref();
 
 export function deleteNotifyToken(token) {
   notifyTokens.delete(token);

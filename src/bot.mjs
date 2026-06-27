@@ -206,9 +206,6 @@ function approvalKeyboard(requestId) {
         { text: '✅ Approve', callback_data: `appr:y:${requestId}` },
         { text: '❌ Deny', callback_data: `appr:n:${requestId}` },
       ],
-      [
-        { text: '⏱ Allow this session', callback_data: `appr:s:${requestId}` },
-      ],
     ],
   };
 }
@@ -365,13 +362,9 @@ function runClaude(prompt, chatId, sk, threadId) {
     };
     claudeArgs.push('--settings', JSON.stringify(hookSettings));
 
-    // Permission posture: yolo bypasses CC's own prompts; strict/guided let hook do the gating.
-    if (mode === 'yolo') {
-      claudeArgs.push('--permission-mode', 'bypassPermissions');
-    } else {
-      claudeArgs.push('--permission-mode', 'bypassPermissions');
-      // ^ we still bypass CC's built-in prompts so OUR hook is the only gate. Cleaner UX.
-    }
+    // Always bypass CC's built-in prompts so OUR PreToolUse hook is the sole gate; the
+    // mode (strict/guided/yolo) is passed through via HERALD_MODE and enforced by the hook.
+    claudeArgs.push('--permission-mode', 'bypassPermissions');
 
     const dockerArgs = [
       'exec', '-i',
@@ -391,9 +384,12 @@ function runClaude(prompt, chatId, sk, threadId) {
     ];
 
     const child = spawn('docker', dockerArgs);
-    runningProcs.set(sk, { child, startedAt: Date.now() });
-    child.stdin.write(prompt);
-    child.stdin.end();
+    const rec = runningProcs.get(sk) || {};
+    rec.child = child;
+    rec.startedAt = rec.startedAt || Date.now();
+    runningProcs.set(sk, rec);
+    child.stdin.on('error', () => {});
+    try { child.stdin.write(prompt); child.stdin.end(); } catch {}
 
     let out = '', err = '';
     let timedOut = false;
@@ -424,6 +420,14 @@ function runClaude(prompt, chatId, sk, threadId) {
 }
 
 async function runAndSend(chatId, prompt, sk, threadId) {
+  // Reserve the slot SYNCHRONOUSLY before any await — two rapid messages could both
+  // pass an upstream runningProcs.has() check otherwise (awaits in runClaude widen the
+  // TOCTOU window). runClaude attaches the child to this placeholder; every exit path
+  // deletes it (success/error/stopped).
+  if (runningProcs.has(sk)) {
+    return sendChunked(chatId, '⏳ Task running — message NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
+  }
+  runningProcs.set(sk, { startedAt: Date.now() });
   await ensureHook();
   askQueues.delete(sk); askPendingOther.delete(sk);
   await tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' });
@@ -444,7 +448,9 @@ async function runAndSend(chatId, prompt, sk, threadId) {
     }
     const markup = detectYesNo(tldr) ? questionKeyboard(sk) : defaultKeyboard(sk);
     await sendChunked(chatId, tldr + costFooter(result, state.getModel(sk)), { markup, threadId });
-    await maybeEscalate(chatId, sk, threadId, "reached this pass's context limit");
+    // No success-path escalation: a normal completed turn must NOT hand the repo to the
+    // supervisor just because TASKS.md has unrelated open items. Only genuinely
+    // unfinished runs (timeout/limit) escalate — see the timed-out branch below.
   } catch (e) {
     if (e.message === 'stopped') {
       await sendChunked(chatId, '🛑 Stopped.', { markup: defaultKeyboard(sk), threadId });
@@ -462,6 +468,8 @@ async function runAndSend(chatId, prompt, sk, threadId) {
     }
   } finally {
     clearInterval(heartbeat);
+    // Defensive: ensure no placeholder is left if runClaude bailed before spawn.
+    runningProcs.delete(sk);
   }
 }
 
@@ -527,14 +535,13 @@ approval.setApprovalHandler(async ({ requestId, chatId, toolName, command, cwd, 
   });
 });
 
-const sessionAllowAlls = new Map(); // sk -> { allow: true, until: ts }
-
 // ── Commands ──────────────────────────────────────────────────────
 
 function handleStop(chatId, sk, threadId) {
   const rec = runningProcs.get(sk);
   if (!rec) return sendChunked(chatId, 'Nothing running.', { markup: defaultKeyboard(sk), threadId });
   rec.stopRequested = true;
+  if (!rec.child) { runningProcs.delete(sk); return sendChunked(chatId, '🛑 Stopped (was starting).', { markup: defaultKeyboard(sk), threadId }); }
   rec.child.kill('SIGTERM');
   setTimeout(() => { try { rec.child.kill('SIGKILL'); } catch {} }, 3000);
   return sendChunked(chatId, '🛑 Stop sent.', { threadId });
@@ -785,7 +792,7 @@ async function handleCallback(cb) {
   }
   if (data.startsWith('appr:')) {
     const [, verdict, requestId] = data.split(':');
-    const ok = verdict === 'y' || verdict === 's';
+    const ok = verdict === 'y';
     const handled = approval.respondTo(requestId, ok, ok ? null : 'denied by user');
     const status = ok ? '✅ Approved' : '❌ Denied';
     await tg('editMessageReplyMarkup', {
@@ -793,10 +800,6 @@ async function handleCallback(cb) {
       message_id: cb.message.message_id,
       reply_markup: { inline_keyboard: [[{ text: `${status} — request closed`, callback_data: 'noop' }]] },
     });
-    if (verdict === 's') {
-      sessionAllowAlls.set(sk, { allow: true, until: Date.now() + 30 * 60 * 1000 });
-      await sendChunked(chatId, '⏱ Allowing similar ops for 30 min.', { threadId });
-    }
     if (!handled) await sendChunked(chatId, '(request already closed or timed out)', { threadId });
     return;
   }
@@ -937,28 +940,53 @@ async function pollLoop() {
   approval.start(HOOK_SECRET);
   ensureHook();
   const allowed = encodeURIComponent(JSON.stringify(['message', 'callback_query']));
+  let backoff = 0; // consecutive-failure counter for exponential backoff
+  const sleepFor = () => 1000 * Math.min(60, 2 ** backoff);
   while (true) {
     try {
       const r = await fetch(`${API}/getUpdates?offset=${offset}&timeout=30&allowed_updates=${allowed}`);
       const j = await r.json();
       if (j.ok) {
+        backoff = 0;
         for (const u of j.result) {
           offset = u.update_id + 1;
           if (u.message) handleMessage(u.message).catch((e) => console.error('handler:', e));
           else if (u.callback_query) handleCallback(u.callback_query).catch((e) => console.error('callback:', e));
         }
+      } else if (j.error_code === 409) {
+        // Another poller owns this bot token — duplicate instance. Exit clean so the
+        // orchestrator restarts a single fresh poller rather than fighting forever.
+        console.error('getUpdates 409 conflict (another poller running) — exiting for clean restart:', j.description);
+        process.exit(1);
       } else {
         console.error('getUpdates not ok:', j);
-        await new Promise((r) => setTimeout(r, 5000));
+        await new Promise((r) => setTimeout(r, sleepFor()));
+        backoff++;
       }
     } catch (e) {
       console.error('poll error:', e.message);
-      await new Promise((r) => setTimeout(r, 5000));
+      await new Promise((r) => setTimeout(r, sleepFor()));
+      backoff++;
     }
   }
 }
 
-process.on('SIGTERM', () => process.exit(0));
-process.on('SIGINT', () => process.exit(0));
+let shuttingDown = false;
+async function gracefulExit() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const affected = [...runningProcs.entries()];
+  for (const [, rec] of affected) {
+    try { rec.child?.kill('SIGTERM'); } catch {}
+  }
+  await Promise.allSettled(affected.map(([sk, rec]) => {
+    const chatId = String(sk).split(':')[0];
+    const threadId = String(sk).includes(':') ? Number(String(sk).split(':')[1]) : undefined;
+    return sendChunked(chatId, '⚠️ Herald restarted — your run was interrupted, tap Continue.', { markup: defaultKeyboard(sk), threadId }).catch(() => {});
+  }));
+  process.exit(0);
+}
+process.on('SIGTERM', gracefulExit);
+process.on('SIGINT', gracefulExit);
 
 pollLoop();
