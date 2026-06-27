@@ -40,7 +40,13 @@ if (!ALLOWED_USERNAME && !ALLOWED_USER_ID) { console.error('ALLOWED_USERNAME or 
 
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
-const runningProcs = new Map(); // chatId -> { child, startedAt }
+const runningProcs = new Map(); // sk -> { child, startedAt }
+
+// Scope key: each forum topic (message_thread_id) is its own independent session.
+// Non-forum / General topic (no threadId) keeps today's flat per-chat scope.
+function topicKey(chatId, threadId) {
+  return threadId ? `${chatId}:${threadId}` : String(chatId);
+}
 
 // ── Telegram helpers ──────────────────────────────────────────────
 
@@ -120,17 +126,19 @@ async function downloadTgFile(fileId, ext = '.bin') {
 
 async function handleImageMessage(msg, fileId, mime, captionOverride) {
   const chatId = msg.chat.id;
-  if (runningProcs.has(chatId)) {
-    return sendChunked(chatId, '⏳ Task running — image NOT sent. Stop first.', { markup: defaultKeyboard(chatId) });
+  const threadId = msg.message_thread_id;
+  const sk = topicKey(chatId, threadId);
+  if (runningProcs.has(sk)) {
+    return sendChunked(chatId, '⏳ Task running — image NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
   }
-  await tg('sendChatAction', { chat_id: chatId, action: 'upload_photo' });
+  await tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'upload_photo' });
   const ext = EXT_BY_MIME[mime] || '.jpg';
   const { path, bytes, error } = await downloadTgFile(fileId, ext);
-  if (error) return sendChunked(chatId, `⚠️ Image failed: ${error}`);
+  if (error) return sendChunked(chatId, `⚠️ Image failed: ${error}`, { threadId });
   const caption = (captionOverride || msg.caption || '').trim();
   const userText = caption || 'What do you see in this image? Describe and suggest any action.';
   const prompt = `[User attached an image. It is available in the target container at ${path} (${bytes} bytes, ${mime}). Use the Read tool on that path to view it.]\n\n${userText}`;
-  await runAndSend(chatId, prompt);
+  await runAndSend(chatId, prompt, sk, threadId);
 }
 
 function authorized(from) {
@@ -142,10 +150,10 @@ function authorized(from) {
 
 // ── Keyboards ─────────────────────────────────────────────────────
 
-function defaultKeyboard(chatId) {
-  const hasSession = !!state.getSession(chatId);
-  const running = runningProcs.has(chatId);
-  const hasDetails = !!state.getLastResponse(chatId)?.details;
+function defaultKeyboard(sk) {
+  const hasSession = !!state.getSession(sk);
+  const running = runningProcs.has(sk);
+  const hasDetails = !!state.getLastResponse(sk)?.details;
   const row1 = [];
   if (hasDetails) row1.push({ text: '📖 Details', callback_data: 'details' });
   if (hasSession && !running) row1.push({ text: '➡️ Continue', callback_data: 'continue' });
@@ -226,24 +234,24 @@ async function launchSupervisor(cwd) {
 
 // After an inline run, if work is unfinished (open tasks remain, or it timed out),
 // hand the repo to the supervisor and tell the user. No-op when nothing's pending.
-async function maybeEscalate(chatId, reason) {
+async function maybeEscalate(chatId, sk, threadId, reason) {
   if (!AUTO_ESCALATE) return false;
-  const cwd = state.getRepo(chatId);
+  const cwd = state.getRepo(sk);
   if (!(await repoHasOpenTasks(cwd))) return false;
   try { await launchSupervisor(cwd); }
   catch (e) { console.error('supervisor launch failed:', e); return false; }
   await sendChunked(chatId,
     `🤖 Didn't finish in one pass (${reason}). Handed to the autonomous supervisor — ` +
     `it'll drive it to done across fresh sessions and message you on progress / done / blocked.`,
-    { markup: defaultKeyboard(chatId) });
+    { markup: defaultKeyboard(sk), threadId });
   return true;
 }
 
-function runClaude(prompt, chatId) {
-  const sessionId = state.getSession(chatId);
-  const model = state.getModel(chatId);
-  const mode = state.getMode(chatId);
-  const cwd = state.getRepo(chatId);
+function runClaude(prompt, chatId, sk, threadId) {
+  const sessionId = state.getSession(sk);
+  const model = state.getModel(sk);
+  const mode = state.getMode(sk);
+  const cwd = state.getRepo(sk);
 
   return new Promise((resolve, reject) => {
     const claudeArgs = [
@@ -292,7 +300,7 @@ function runClaude(prompt, chatId) {
     ];
 
     const child = spawn('docker', dockerArgs);
-    runningProcs.set(chatId, { child, startedAt: Date.now() });
+    runningProcs.set(sk, { child, startedAt: Date.now() });
     child.stdin.write(prompt);
     child.stdin.end();
 
@@ -306,11 +314,11 @@ function runClaude(prompt, chatId) {
 
     child.stdout.on('data', (d) => { out += d.toString(); });
     child.stderr.on('data', (d) => { err += d.toString(); });
-    child.on('error', (e) => { clearTimeout(killTimer); runningProcs.delete(chatId); reject(e); });
+    child.on('error', (e) => { clearTimeout(killTimer); runningProcs.delete(sk); reject(e); });
     child.on('close', (code, signal) => {
       clearTimeout(killTimer);
-      const wasStopped = runningProcs.get(chatId)?.stopRequested;
-      runningProcs.delete(chatId);
+      const wasStopped = runningProcs.get(sk)?.stopRequested;
+      runningProcs.delete(sk);
       if (timedOut) return;
       if (wasStopped || signal === 'SIGTERM' || signal === 'SIGKILL' || code === 137 || code === 143) {
         return reject(new Error('stopped'));
@@ -324,23 +332,23 @@ function runClaude(prompt, chatId) {
   });
 }
 
-async function runAndSend(chatId, prompt) {
+async function runAndSend(chatId, prompt, sk, threadId) {
   await ensureHook();
-  await tg('sendChatAction', { chat_id: chatId, action: 'typing' });
+  await tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' });
   const heartbeat = setInterval(() => {
-    tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+    tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' }).catch(() => {});
   }, 4000);
   try {
-    const result = await runClaude(prompt, chatId);
-    state.setSession(chatId, result.session_id);
+    const result = await runClaude(prompt, chatId, sk, threadId);
+    state.setSession(sk, result.session_id);
     const body = result.result ?? JSON.stringify(result, null, 2);
     const { tldr, details } = splitTldr(body);
-    state.setLastResponse(chatId, { tldr, details, model: state.getModel(chatId) });
-    await sendChunked(chatId, tldr + costFooter(result, state.getModel(chatId)), { markup: defaultKeyboard(chatId) });
-    await maybeEscalate(chatId, "reached this pass's context limit");
+    state.setLastResponse(sk, { tldr, details, model: state.getModel(sk) });
+    await sendChunked(chatId, tldr + costFooter(result, state.getModel(sk)), { markup: defaultKeyboard(sk), threadId });
+    await maybeEscalate(chatId, sk, threadId, "reached this pass's context limit");
   } catch (e) {
     if (e.message === 'stopped') {
-      await sendChunked(chatId, '🛑 Stopped.', { markup: defaultKeyboard(chatId) });
+      await sendChunked(chatId, '🛑 Stopped.', { markup: defaultKeyboard(sk), threadId });
     } else {
       console.error('claude error:', e);
       const full = e.message;
@@ -349,9 +357,9 @@ async function runAndSend(chatId, prompt) {
       if (containerDown) summary = `⚠️ ${TARGET_CONTAINER} not running.`;
       else if (full.includes('timed out')) summary = `⏱️ Timed out after ${Math.round(CLAUDE_TIMEOUT_MS / 60000)} min.`;
       else summary = `⚠️ Claude errored. Tap 📖 Details for full trace.`;
-      state.setLastResponse(chatId, { tldr: summary, details: full, model: state.getModel(chatId) });
-      await sendChunked(chatId, summary, { markup: defaultKeyboard(chatId) });
-      if (full.includes('timed out')) await maybeEscalate(chatId, 'timed out');
+      state.setLastResponse(sk, { tldr: summary, details: full, model: state.getModel(sk) });
+      await sendChunked(chatId, summary, { markup: defaultKeyboard(sk), threadId });
+      if (full.includes('timed out')) await maybeEscalate(chatId, sk, threadId, 'timed out');
     }
   } finally {
     clearInterval(heartbeat);
@@ -360,7 +368,7 @@ async function runAndSend(chatId, prompt) {
 
 // ── Approval flow ─────────────────────────────────────────────────
 
-// chatId -> { token, container, target, msgId } — set when user taps ✏️ Reply; next msg goes to tmux.
+// sk -> { token, container, target, msgId } — set when user taps ✏️ Reply; next msg goes to tmux.
 const replyPending = new Map();
 
 approval.setChatIdResolver(() => state.get().knownUserId);
@@ -423,58 +431,60 @@ approval.setApprovalHandler(async ({ requestId, chatId, toolName, command, cwd, 
   });
 });
 
-const sessionAllowAlls = new Map(); // chatId -> { allow: true, until: ts }
+const sessionAllowAlls = new Map(); // sk -> { allow: true, until: ts }
 
 // ── Commands ──────────────────────────────────────────────────────
 
-function handleStop(chatId) {
-  const rec = runningProcs.get(chatId);
-  if (!rec) return sendChunked(chatId, 'Nothing running.', { markup: defaultKeyboard(chatId) });
+function handleStop(chatId, sk, threadId) {
+  const rec = runningProcs.get(sk);
+  if (!rec) return sendChunked(chatId, 'Nothing running.', { markup: defaultKeyboard(sk), threadId });
   rec.stopRequested = true;
   rec.child.kill('SIGTERM');
   setTimeout(() => { try { rec.child.kill('SIGKILL'); } catch {} }, 3000);
-  return sendChunked(chatId, '🛑 Stop sent.');
+  return sendChunked(chatId, '🛑 Stop sent.', { threadId });
 }
 
-async function handleSettings(chatId) {
-  const { text, markup } = settings.settingsMenu(chatId);
-  return sendChunked(chatId, text, { markup });
+async function handleSettings(chatId, sk, threadId) {
+  const { text, markup } = settings.settingsMenu(sk);
+  return sendChunked(chatId, text, { markup, threadId });
 }
 
-async function handlePr(chatId, num) {
-  if (!num || !/^\d+$/.test(num)) return sendChunked(chatId, 'Usage: /pr <number>');
-  await tg('sendChatAction', { chat_id: chatId, action: 'typing' });
-  const cwd = state.getRepo(chatId);
+async function handlePr(chatId, num, sk, threadId) {
+  if (!num || !/^\d+$/.test(num)) return sendChunked(chatId, 'Usage: /pr <number>', { threadId });
+  await tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' });
+  const cwd = state.getRepo(sk);
   const { pr, error } = await gh.viewPr(cwd, num);
-  if (error) return sendChunked(chatId, `gh error: ${error.slice(0, 500)}`);
-  return sendChunked(chatId, gh.summarizePr(pr), { markup: gh.prKeyboard(pr.number, pr.url) });
+  if (error) return sendChunked(chatId, `gh error: ${error.slice(0, 500)}`, { threadId });
+  return sendChunked(chatId, gh.summarizePr(pr), { markup: gh.prKeyboard(pr.number, pr.url), threadId });
 }
 
-async function handlePrs(chatId) {
-  await tg('sendChatAction', { chat_id: chatId, action: 'typing' });
-  const cwd = state.getRepo(chatId);
+async function handlePrs(chatId, sk, threadId) {
+  await tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' });
+  const cwd = state.getRepo(sk);
   const { prs, error } = await gh.listPrs(cwd);
-  if (error) return sendChunked(chatId, `gh error: ${error.slice(0, 500)}`);
-  if (!prs.length) return sendChunked(chatId, 'No open PRs assigned to you.');
+  if (error) return sendChunked(chatId, `gh error: ${error.slice(0, 500)}`, { threadId });
+  if (!prs.length) return sendChunked(chatId, 'No open PRs assigned to you.', { threadId });
   const text = prs.map((p) => `#${p.number} ${p.title}\n  ${p.headRefName}`).join('\n\n');
   const markup = {
     inline_keyboard: prs.slice(0, 10).map((p) => [
       { text: `#${p.number} ${p.title.slice(0, 50)}`, callback_data: `pr:view:${p.number}` },
     ]),
   };
-  return sendChunked(chatId, text, { markup });
+  return sendChunked(chatId, text, { markup, threadId });
 }
 
-async function handleRepo(chatId, arg) {
-  if (!arg) return sendChunked(chatId, `Current: ${state.getRepo(chatId)}\nUsage: /repo <path>`);
-  state.setRepo(chatId, arg);
-  return sendChunked(chatId, `Repo → ${arg}`, { markup: defaultKeyboard(chatId) });
+async function handleRepo(chatId, arg, sk, threadId) {
+  if (!arg) return sendChunked(chatId, `Current: ${state.getRepo(sk)}\nUsage: /repo <path>`, { threadId });
+  state.setRepo(sk, arg);
+  return sendChunked(chatId, `Repo → ${arg}`, { markup: defaultKeyboard(sk), threadId });
 }
 
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
+  const threadId = msg.message_thread_id;
+  const sk = topicKey(chatId, threadId);
   const kinds = Object.keys(msg).filter((k) => !['message_id','from','chat','date','message_thread_id'].includes(k)).join(',');
-  console.log(`msg from @${msg.from?.username || '?'} chat=${chatId} kinds=[${kinds}]`);
+  console.log(`msg from @${msg.from?.username || '?'} chat=${chatId} thread=${threadId ?? '-'} kinds=[${kinds}]`);
   if (!authorized(msg.from)) {
     console.log(`unauth: @${msg.from?.username || '?'} id=${msg.from?.id}`);
     return;
@@ -515,58 +525,58 @@ async function handleMessage(msg) {
       '/stop — kill running task\n' +
       '/status — session + mode + model\n' +
       '/ping — liveness',
-      { markup: defaultKeyboard(chatId) }
+      { markup: defaultKeyboard(sk), threadId }
     );
   }
-  if (text === '/ping') return sendChunked(chatId, 'pong');
-  if (text === '/whoami') return sendChunked(chatId, `user_id=${msg.from?.id}\nusername=@${msg.from?.username}`);
-  if (text === '/settings' || text === '/menu') return handleSettings(chatId);
+  if (text === '/ping') return sendChunked(chatId, 'pong', { threadId });
+  if (text === '/whoami') return sendChunked(chatId, `user_id=${msg.from?.id}\nusername=@${msg.from?.username}`, { threadId });
+  if (text === '/settings' || text === '/menu') return handleSettings(chatId, sk, threadId);
   if (text === '/new') {
-    state.clearSession(chatId);
-    return sendChunked(chatId, '🆕 New session.', { markup: defaultKeyboard(chatId) });
+    state.clearSession(sk);
+    return sendChunked(chatId, '🆕 New session.', { markup: defaultKeyboard(sk), threadId });
   }
-  if (text === '/stop') return handleStop(chatId);
+  if (text === '/stop') return handleStop(chatId, sk, threadId);
   if (text === '/continue') {
-    if (runningProcs.has(chatId)) return sendChunked(chatId, '⏳ Already running.');
-    if (!state.getSession(chatId)) return sendChunked(chatId, 'No session. Send a message to start.');
-    return runAndSend(chatId, 'continue');
+    if (runningProcs.has(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
+    if (!state.getSession(sk)) return sendChunked(chatId, 'No session. Send a message to start.', { threadId });
+    return runAndSend(chatId, 'continue', sk, threadId);
   }
   if (text === '/status') {
-    const running = runningProcs.has(chatId);
+    const running = runningProcs.has(sk);
     return sendChunked(chatId,
-      `mode: ${settings.MODE_LABELS[state.getMode(chatId)]}\n` +
-      `model: ${state.getModel(chatId)}\n` +
-      `repo: ${state.getRepo(chatId)}\n` +
-      `session: ${state.getSession(chatId) || '(none)'}\n` +
+      `mode: ${settings.MODE_LABELS[state.getMode(sk)]}\n` +
+      `model: ${state.getModel(sk)}\n` +
+      `repo: ${state.getRepo(sk)}\n` +
+      `session: ${state.getSession(sk) || '(none)'}\n` +
       `state: ${running ? 'running' : 'idle'}`,
-      { markup: defaultKeyboard(chatId) }
+      { markup: defaultKeyboard(sk), threadId }
     );
   }
-  if (text.startsWith('/pr ')) return handlePr(chatId, text.slice(4).trim());
-  if (text === '/prs') return handlePrs(chatId);
-  if (text.startsWith('/repo')) return handleRepo(chatId, text.slice(5).trim());
+  if (text.startsWith('/pr ')) return handlePr(chatId, text.slice(4).trim(), sk, threadId);
+  if (text === '/prs') return handlePrs(chatId, sk, threadId);
+  if (text.startsWith('/repo')) return handleRepo(chatId, text.slice(5).trim(), sk, threadId);
 
   // If a notify-reply is pending, route this message into the tmux session instead of starting a new claude run.
-  const pendingReply = replyPending.get(chatId);
+  const pendingReply = replyPending.get(sk);
   if (pendingReply) {
     if (text === '/cancel') {
-      replyPending.delete(chatId);
-      return sendChunked(chatId, '↩️ Reply cancelled.', { markup: defaultKeyboard(chatId) });
+      replyPending.delete(sk);
+      return sendChunked(chatId, '↩️ Reply cancelled.', { markup: defaultKeyboard(sk), threadId });
     }
-    replyPending.delete(chatId);
+    replyPending.delete(sk);
     try {
       await sendTmuxKeys(pendingReply.container, pendingReply.target, text);
       approval.deleteNotifyToken(pendingReply.token);
-      return sendChunked(chatId, `✉️ Sent → ${pendingReply.target}`, { markup: defaultKeyboard(chatId) });
+      return sendChunked(chatId, `✉️ Sent → ${pendingReply.target}`, { markup: defaultKeyboard(sk), threadId });
     } catch (e) {
-      return sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`);
+      return sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`, { threadId });
     }
   }
 
-  if (runningProcs.has(chatId)) {
-    return sendChunked(chatId, '⏳ Task running — message NOT sent. Stop first.', { markup: defaultKeyboard(chatId) });
+  if (runningProcs.has(sk)) {
+    return sendChunked(chatId, '⏳ Task running — message NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
   }
-  await runAndSend(chatId, text);
+  await runAndSend(chatId, text, sk, threadId);
 }
 
 // ── Callback queries ──────────────────────────────────────────────
@@ -574,6 +584,9 @@ async function handleMessage(msg) {
 async function handleCallback(cb) {
   const chatId = cb.message?.chat?.id;
   if (!chatId) return;
+  // Scope the tap to the topic its message lives in, so a button in topic X acts on X.
+  const threadId = cb.message?.message_thread_id;
+  const sk = topicKey(chatId, threadId);
   if (!authorized(cb.from)) {
     return tg('answerCallbackQuery', { callback_query_id: cb.id, text: 'Unauthorized', show_alert: true });
   }
@@ -581,29 +594,29 @@ async function handleCallback(cb) {
   await tg('answerCallbackQuery', { callback_query_id: cb.id });
 
   if (data === 'details') {
-    const last = state.getLastResponse(chatId);
-    if (!last?.details) return sendChunked(chatId, '(no details)');
-    return sendChunked(chatId, last.details, { markup: defaultKeyboard(chatId) });
+    const last = state.getLastResponse(sk);
+    if (!last?.details) return sendChunked(chatId, '(no details)', { threadId });
+    return sendChunked(chatId, last.details, { markup: defaultKeyboard(sk), threadId });
   }
   if (data === 'continue') {
-    if (runningProcs.has(chatId)) return sendChunked(chatId, '⏳ Already running.');
-    if (!state.getSession(chatId)) return sendChunked(chatId, 'No session.');
-    return runAndSend(chatId, 'continue');
+    if (runningProcs.has(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
+    if (!state.getSession(sk)) return sendChunked(chatId, 'No session.', { threadId });
+    return runAndSend(chatId, 'continue', sk, threadId);
   }
   if (data === 'new') {
-    state.clearSession(chatId);
-    return sendChunked(chatId, '🆕 New session.', { markup: defaultKeyboard(chatId) });
+    state.clearSession(sk);
+    return sendChunked(chatId, '🆕 New session.', { markup: defaultKeyboard(sk), threadId });
   }
-  if (data === 'stop') return handleStop(chatId);
-  if (data === 'settings') return handleSettings(chatId);
+  if (data === 'stop') return handleStop(chatId, sk, threadId);
+  if (data === 'settings') return handleSettings(chatId, sk, threadId);
   if (data === 'menu:close') {
     return tg('editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] } });
   }
   if (data.startsWith('mode:')) {
     const m = data.slice(5);
     if (!settings.MODES.includes(m)) return;
-    state.setMode(chatId, m);
-    const { text, markup } = settings.settingsMenu(chatId);
+    state.setMode(sk, m);
+    const { text, markup } = settings.settingsMenu(sk);
     return tg('editMessageText', {
       chat_id: chatId,
       message_id: cb.message.message_id,
@@ -614,8 +627,8 @@ async function handleCallback(cb) {
   if (data.startsWith('model:')) {
     const m = data.slice(6);
     if (!settings.MODELS.includes(m)) return;
-    state.setModel(chatId, m);
-    const { text, markup } = settings.settingsMenu(chatId);
+    state.setModel(sk, m);
+    const { text, markup } = settings.settingsMenu(sk);
     return tg('editMessageText', {
       chat_id: chatId,
       message_id: cb.message.message_id,
@@ -634,10 +647,10 @@ async function handleCallback(cb) {
       reply_markup: { inline_keyboard: [[{ text: `${status} — request closed`, callback_data: 'noop' }]] },
     });
     if (verdict === 's') {
-      sessionAllowAlls.set(chatId, { allow: true, until: Date.now() + 30 * 60 * 1000 });
-      await sendChunked(chatId, '⏱ Allowing similar ops for 30 min.');
+      sessionAllowAlls.set(sk, { allow: true, until: Date.now() + 30 * 60 * 1000 });
+      await sendChunked(chatId, '⏱ Allowing similar ops for 30 min.', { threadId });
     }
-    if (!handled) await sendChunked(chatId, '(request already closed or timed out)');
+    if (!handled) await sendChunked(chatId, '(request already closed or timed out)', { threadId });
     return;
   }
   if (data.startsWith('notif:')) {
@@ -664,7 +677,7 @@ async function handleCallback(cb) {
           reply_markup: { inline_keyboard: [[{ text: `↳ sent "${key}"`, callback_data: 'noop' }]] },
         });
       } catch (e) {
-        await sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`);
+        await sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`, { threadId });
       }
       return;
     }
@@ -678,12 +691,12 @@ async function handleCallback(cb) {
           reply_markup: { inline_keyboard: [[{ text: '↳ sent Esc', callback_data: 'noop' }]] },
         });
       } catch (e) {
-        await sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`);
+        await sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`, { threadId });
       }
       return;
     }
     if (verb === 'reply') {
-      replyPending.set(chatId, { token, container: rec.container, target: rec.target });
+      replyPending.set(sk, { token, container: rec.container, target: rec.target });
       await tg('editMessageReplyMarkup', {
         chat_id: chatId,
         message_id: cb.message.message_id,
@@ -695,23 +708,23 @@ async function handleCallback(cb) {
   }
   if (data.startsWith('pr:view:')) {
     const num = data.split(':')[2];
-    return handlePr(chatId, num);
+    return handlePr(chatId, num, sk, threadId);
   }
   if (data.startsWith('pr:review:')) {
     const num = data.split(':')[2];
-    return runAndSend(chatId, `/review ${num}`);
+    return runAndSend(chatId, `/review ${num}`, sk, threadId);
   }
   if (data.startsWith('pr:approve:')) {
     const num = data.split(':')[2];
-    const cwd = state.getRepo(chatId);
+    const cwd = state.getRepo(sk);
     const { ok, err } = await gh.approvePr(cwd, num);
-    return sendChunked(chatId, ok ? `✅ Approved PR #${num}` : `Failed: ${err.slice(0, 300)}`);
+    return sendChunked(chatId, ok ? `✅ Approved PR #${num}` : `Failed: ${err.slice(0, 300)}`, { threadId });
   }
   if (data.startsWith('pr:merge:')) {
     const num = data.split(':')[2];
-    const cwd = state.getRepo(chatId);
+    const cwd = state.getRepo(sk);
     const { ok, err } = await gh.mergePr(cwd, num);
-    return sendChunked(chatId, ok ? `🔀 Merged PR #${num}` : `Failed: ${err.slice(0, 300)}`);
+    return sendChunked(chatId, ok ? `🔀 Merged PR #${num}` : `Failed: ${err.slice(0, 300)}`, { threadId });
   }
 }
 
