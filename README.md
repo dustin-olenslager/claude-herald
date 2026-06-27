@@ -120,7 +120,9 @@ Strict mode also gates:
 
 | Command | Does |
 |---|---|
+| `/start` | Welcome + help message |
 | `/settings` | Mode + model picker (inline buttons) |
+| `/menu` | Alias for `/settings` |
 | `/pr <num>` | View PR, get [Review][Approve][Merge][Open] buttons |
 | `/prs` | List your open PRs, one tap to view each |
 | `/repo <path>` | Switch the working directory (per-chat) |
@@ -130,6 +132,8 @@ Strict mode also gates:
 | `/status` | Show mode, model, repo, session state |
 | `/help` | Help message |
 | `/ping` | Liveness check |
+| `/whoami` | Show your Telegram user id + username |
+| `/cancel` | Cancel a pending notify-reply (only while one is queued) |
 
 Buttons under every reply: 📖 Details · ➡️ Continue · 🛑 Stop · 🆕 New · ⚙️ Settings — only the relevant ones show at any given time.
 

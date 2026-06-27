@@ -1,4 +1,4 @@
-import { getMode, setMode, getModel, setModel } from './state.mjs';
+import { getMode, getModel } from './state.mjs';
 
 export const MODES = ['strict', 'guided', 'yolo'];
 export const MODELS = ['haiku', 'sonnet', 'opus'];
@@ -41,17 +41,3 @@ export function settingsMenu(chatId) {
   };
   return { text, markup };
 }
-
-export function modeExplainer() {
-  return [
-    'Approval modes:',
-    '',
-    `${MODE_LABELS.strict} — ${MODE_DESCRIPTIONS.strict}`,
-    `${MODE_LABELS.guided} — ${MODE_DESCRIPTIONS.guided}`,
-    `${MODE_LABELS.yolo} — ${MODE_DESCRIPTIONS.yolo}`,
-    '',
-    'Default: ⚖️ Guided. Change anytime with /settings.',
-  ].join('\n');
-}
-
-export { getMode, setMode, getModel, setModel };

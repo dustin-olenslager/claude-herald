@@ -486,15 +486,12 @@ approval.setNotifyHandler(async ({ token, chatId, message, container, tmuxTarget
     '',
     (message || '(no message)').slice(0, 3500),
   ].filter(Boolean).join('\n');
-  const resp = await tg('sendMessage', {
+  await tg('sendMessage', {
     chat_id: chatId,
     text,
     reply_markup: notifyKeyboard(token),
     disable_web_page_preview: true,
   });
-  if (resp?.ok && resp.result?.message_id) {
-    approval.setNotifyMsgId(token, resp.result.message_id);
-  }
 });
 
 approval.setApprovalHandler(async ({ requestId, chatId, toolName, command, cwd, mode }) => {

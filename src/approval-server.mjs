@@ -6,7 +6,7 @@ const NOTIFY_TTL_MS = (Number(process.env.NOTIFY_TTL_SECONDS) || 3600) * 1000;
 const PORT = Number(process.env.APPROVAL_PORT) || 7788;
 
 const pending = new Map();   // requestId -> { resolve, chatId, ts, timer, ... }
-const notifyTokens = new Map(); // token -> { chatId, container, target, sessionId, msgId, ts }
+const notifyTokens = new Map(); // token -> { chatId, container, target, sessionId, ts }
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -150,11 +150,6 @@ export function getNotifyToken(token) {
   return notifyTokens.get(token);
 }
 
-export function setNotifyMsgId(token, msgId) {
-  const rec = notifyTokens.get(token);
-  if (rec) rec.msgId = msgId;
-}
-
 export function deleteNotifyToken(token) {
   notifyTokens.delete(token);
 }
@@ -162,12 +157,4 @@ export function deleteNotifyToken(token) {
 export function rewriteNotifyContainer(token, container) {
   const rec = notifyTokens.get(token);
   if (rec) rec.container = container;
-}
-
-export function getPending(requestId) { return pending.get(requestId); }
-
-export function listPendingByChat(chatId) {
-  return Array.from(pending.entries())
-    .filter(([, rec]) => rec.chatId === chatId)
-    .map(([id, rec]) => ({ id, ...rec }));
 }
