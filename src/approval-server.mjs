@@ -109,12 +109,12 @@ async function handleEvent(req, res) {
   let body;
   try { body = await readBody(req); } catch { res.writeHead(400).end('bad json'); return; }
   let { chatId } = body;
-  const { event, message, repo } = body;
+  const { event, message, repo, thread } = body;
   if (!chatId && chatIdResolver) { try { chatId = await chatIdResolver(); } catch {} }
   if (!chatId) { res.writeHead(400).end('chatId (or resolver) required'); return; }
   res.writeHead(202, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: true }));
   if (onEvent) {
-    onEvent({ chatId, event: event || 'info', message: message || '', repo: repo || '' })
+    onEvent({ chatId, event: event || 'info', message: message || '', repo: repo || '', thread: thread || '' })
       .catch((e) => console.error('event handler error:', e));
   }
 }

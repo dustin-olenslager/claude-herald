@@ -53,7 +53,7 @@ async function tg(method, body) {
   return r.json();
 }
 
-async function sendChunked(chatId, text, { code = false, markup } = {}) {
+async function sendChunked(chatId, text, { code = false, markup, threadId } = {}) {
   if (!text) text = '(empty)';
   const wrap = code ? (s) => '```\n' + s + '\n```' : (s) => s;
   const limit = code ? 3900 : 4000;
@@ -63,12 +63,27 @@ async function sendChunked(chatId, text, { code = false, markup } = {}) {
     const isLast = i === chunks.length - 1;
     await tg('sendMessage', {
       chat_id: chatId,
+      message_thread_id: threadId || undefined,
       text: wrap(chunks[i]),
       parse_mode: code ? 'MarkdownV2' : undefined,
       disable_web_page_preview: true,
       reply_markup: isLast && markup ? markup : undefined,
     });
   }
+}
+
+// Auto-create (once) a forum topic per job name so each repo's reports land in their
+// own thread instead of one blurred feed. Caches the id; caches 0 when the chat is not
+// a forum (no rights / not a supergroup-with-topics) so we fall back to flat and never
+// retry. Returns a message_thread_id, or undefined to send flat (today's behavior).
+async function topicFor(chatId, name) {
+  if (!name) return undefined;
+  const cached = state.getTopic(chatId, name);
+  if (cached !== undefined) return cached || undefined; // 0 -> flat
+  const r = await tg('createForumTopic', { chat_id: chatId, name: String(name).slice(0, 128) }).catch(() => null);
+  const id = (r && r.ok && r.result && r.result.message_thread_id) || 0;
+  state.setTopic(chatId, name, id); // 0 = flat (not a forum / no rights)
+  return id || undefined;
 }
 
 // ── Image/file handling ───────────────────────────────────────────
@@ -351,11 +366,16 @@ const replyPending = new Map();
 approval.setChatIdResolver(() => state.get().knownUserId);
 
 // Phalanx supervisor status events -> plain Telegram message (no Reply button).
-approval.setEventHandler(async ({ chatId, event, message }) => {
+approval.setEventHandler(async ({ chatId, event, message, repo, thread }) => {
   const icon = { start: '🚀', progress: '⏳', done: '✅', blocked: '⛔' }[event] || '🤖';
+  // Per-job routing key from the notify port: prefer the explicit thread, else the
+  // repo basename. Each job's reports land in their own forum topic (flat fallback).
+  const name = (thread || (repo ? repo.split('/').pop() : '') || '').trim();
+  const threadId = await topicFor(chatId, name).catch(() => undefined);
   await tg('sendMessage', {
     chat_id: chatId,
-    text: `${icon} Supervisor: ${event}\n${(message || '').slice(0, 3500)}`,
+    message_thread_id: threadId || undefined,
+    text: `${icon} ${name ? name + ' — ' : ''}Supervisor: ${event}\n${(message || '').slice(0, 3500)}`,
     disable_web_page_preview: true,
   });
 });

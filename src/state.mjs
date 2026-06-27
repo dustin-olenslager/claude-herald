@@ -9,6 +9,7 @@ const DEFAULT_STATE = {
   modes: {},          // chatId -> strict | guided | yolo
   lastResponse: {},   // chatId -> { tldr, details, ts, model }
   repos: {},          // chatId -> current working repo path
+  topics: {},         // `${chatId}:${name}` -> forum topic message_thread_id (0 = flat / not a forum)
   knownUserId: null,
 };
 
@@ -78,5 +79,16 @@ export function getRepo(chatId) {
 
 export function setRepo(chatId, repoPath) {
   state.repos[chatId] = repoPath;
+  save();
+}
+
+// Per-job forum topic cache. undefined = never tried; a number = topic id; 0 = tried
+// and the chat is not a forum (so route flat and don't retry).
+export function getTopic(chatId, name) {
+  return state.topics[`${chatId}:${name}`];
+}
+
+export function setTopic(chatId, name, threadId) {
+  state.topics[`${chatId}:${name}`] = threadId;
   save();
 }
