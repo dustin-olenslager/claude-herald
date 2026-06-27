@@ -1,0 +1,87 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { parseAsk, stripAsk, detectYesNo, nextAfterAnswer } from '../src/ask-flow.mjs';
+
+test('parseAsk: single valid block', () => {
+  const r = parseAsk('summary\n<<ASK>>\n[{"q":"Drop or rename?","opts":["drop","rename"]}]\n<<END>>');
+  assert.deepEqual(r, [{ q: 'Drop or rename?', opts: ['drop', 'rename'] }]);
+});
+
+test('parseAsk: multiple decisions in one block', () => {
+  const r = parseAsk('<<ASK>>[{"q":"A","opts":["1","2"]},{"q":"B","opts":["x","y","z"]}]<<END>>');
+  assert.equal(r.length, 2);
+  assert.equal(r[1].q, 'B');
+  assert.deepEqual(r[1].opts, ['x', 'y', 'z']);
+});
+
+test('parseAsk: caps opts at 4', () => {
+  const r = parseAsk('<<ASK>>[{"q":"Q","opts":["a","b","c","d","e","f"]}]<<END>>');
+  assert.deepEqual(r[0].opts, ['a', 'b', 'c', 'd']);
+});
+
+test('parseAsk: no block → null', () => {
+  assert.equal(parseAsk('just a normal reply'), null);
+});
+
+test('parseAsk: malformed JSON → null', () => {
+  assert.equal(parseAsk('<<ASK>>[{not json}]<<END>>'), null);
+});
+
+test('parseAsk: non-array JSON → null', () => {
+  assert.equal(parseAsk('<<ASK>>{"q":"x","opts":["a"]}<<END>>'), null);
+});
+
+test('parseAsk: drops items missing q or opts', () => {
+  const r = parseAsk('<<ASK>>[{"q":"keep","opts":["a"]},{"q":"noopts"},{"opts":["a"]}]<<END>>');
+  assert.deepEqual(r, [{ q: 'keep', opts: ['a'] }]);
+});
+
+test('parseAsk: coerces non-string q/opts to strings', () => {
+  const r = parseAsk('<<ASK>>[{"q":123,"opts":[1,2]}]<<END>>');
+  assert.deepEqual(r, [{ q: '123', opts: ['1', '2'] }]);
+});
+
+test('stripAsk: removes the block and trims', () => {
+  assert.equal(stripAsk('hello\n<<ASK>>[{"q":"x","opts":["a"]}]<<END>>'), 'hello');
+});
+
+test('stripAsk: removes multiple blocks', () => {
+  assert.equal(stripAsk('a<<ASK>>x<<END>>b<<ASK>>y<<END>>c'), 'abc');
+});
+
+test('stripAsk: no block leaves text intact', () => {
+  assert.equal(stripAsk('  plain  '), 'plain');
+});
+
+test('detectYesNo: yes/no question → true', () => {
+  assert.equal(detectYesNo('Should I proceed?'), true);
+});
+
+test('detectYesNo: wh- question → false', () => {
+  assert.equal(detectYesNo('Which option do you want?'), false);
+});
+
+test('detectYesNo: statement (no ?) → false', () => {
+  assert.equal(detectYesNo('Done. All tests pass.'), false);
+});
+
+test('detectYesNo: trailing bracket footer still detected', () => {
+  assert.equal(detectYesNo('Ready to merge? [PR #5]'), true);
+});
+
+test('nextAfterAnswer: more questions → present next idx', () => {
+  const q = { items: [{ q: 'A', opts: [] }, { q: 'B', opts: [] }], answers: ['x'], idx: 0 };
+  assert.deepEqual(nextAfterAnswer(q), { kind: 'present', idx: 1 });
+});
+
+test('nextAfterAnswer: last question → finish with compiled answers', () => {
+  const q = { items: [{ q: 'A?', opts: [] }, { q: 'B?', opts: [] }], answers: ['yes', 'no'], idx: 1 };
+  const r = nextAfterAnswer(q);
+  assert.equal(r.kind, 'finish');
+  assert.equal(r.compiled, '1. A? → yes\n2. B? → no');
+});
+
+test('nextAfterAnswer: single-question queue finishes immediately', () => {
+  const q = { items: [{ q: 'Only?', opts: [] }], answers: ['ok'], idx: 0 };
+  assert.deepEqual(nextAfterAnswer(q), { kind: 'finish', compiled: '1. Only? → ok' });
+});

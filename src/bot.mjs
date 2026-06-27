@@ -1,24 +1,23 @@
-import { spawn, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import fs from 'node:fs';
-import crypto from 'node:crypto';
-const execFileP = promisify(execFile);
 import * as state from './state.mjs';
 import * as settings from './settings.mjs';
 import * as approval from './approval-server.mjs';
 import * as gh from './github.mjs';
-import { TLDR_INSTRUCTION, splitTldr, costFooter } from './tldr.mjs';
+import * as tgkb from './telegram.mjs';
+import { makeContainerExec } from './container-exec.mjs';
+import { makeHookInstaller } from './hook-installer.mjs';
+import { makeSupervisor } from './supervisor.mjs';
+import { makeRunner } from './runner.mjs';
+import { decode } from './callback-codec.mjs';
 
+// ── Config ────────────────────────────────────────────────────────
 const TOKEN = process.env.BOT_TOKEN;
 const ALLOWED_USERNAME = (process.env.ALLOWED_USERNAME || '').replace(/^@/, '');
 const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID ? Number(process.env.ALLOWED_USER_ID) : null;
 const TARGET_CONTAINER = process.env.TARGET_CONTAINER || 'claude-code-rc';
 const TARGET_USER = process.env.TARGET_USER || 'cc';
-const TARGET_WORKDIR = process.env.TARGET_WORKDIR || '/workspace';
 const CLAUDE_TIMEOUT_MS = process.env.CLAUDE_TIMEOUT_MS != null ? Number(process.env.CLAUDE_TIMEOUT_MS) : 600000;
-// Claude Code's own default API request timeout is 600000ms (10 min). A non-login
-// `docker exec` does NOT inherit the target container's interactive-shell env, so these
-// must be passed through explicitly or long turns get killed at 10 min.
+// A non-login `docker exec` does NOT inherit the target's interactive-shell env, so
+// these must be passed through explicitly or long turns get killed at 10 min.
 const API_TIMEOUT_MS = process.env.CLAUDE_API_TIMEOUT_MS || '3600000';
 const BASH_DEFAULT_TIMEOUT_MS = process.env.CLAUDE_BASH_DEFAULT_TIMEOUT_MS || '300000';
 const BASH_MAX_TIMEOUT_MS = process.env.CLAUDE_BASH_MAX_TIMEOUT_MS || '3600000';
@@ -43,64 +42,61 @@ const API = `https://api.telegram.org/bot${TOKEN}`;
 // Shared HTTP-boundary secret (persisted in state.json; readable by the host cron).
 const HOOK_SECRET = state.ensureHookSecret();
 
-const runningProcs = new Map(); // sk -> { child, startedAt }
-
-// Only targets matching herald-tmux.sh's scheme (<session>:0.0) may receive
-// send-keys, so a rogue /notify caller can't aim keystrokes at an arbitrary pane.
-const TMUX_TARGET_RE = /^[A-Za-z0-9_.-]+:0\.0$/;
-
 // Scope key: each forum topic (message_thread_id) is its own independent session.
 // Non-forum / General topic (no threadId) keeps today's flat per-chat scope.
 function topicKey(chatId, threadId) {
   return threadId ? `${chatId}:${threadId}` : String(chatId);
 }
 
-// ── Telegram helpers ──────────────────────────────────────────────
+// ── Composition root: wire the modules ────────────────────────────
+const exec = makeContainerExec({ container: TARGET_CONTAINER, user: TARGET_USER });
+const telegram = tgkb.makeTelegram({ token: TOKEN, state, copyFileToContainer: exec.copyFileToContainer });
+const { tg, sendChunked, topicFor, downloadTgFile } = telegram;
 
-async function tg(method, body) {
-  const r = await fetch(`${API}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+const hookInstaller = makeHookInstaller({
+  exec,
+  paths: { HOOK_SRC, HOOK_PATH, NOTIFY_HOOK_SRC, NOTIFY_HOOK_PATH, TMUX_LAUNCHER_SRC, TMUX_LAUNCHER_PATH },
+});
+
+const supervisor = makeSupervisor({
+  exec, state, tg: telegram,
+  deps: { AUTO_ESCALATE, BOT_URL_FOR_HOOK, HOOK_SECRET, SUPERVISORD_PATH },
+});
+
+// Per-sk keyboard producers close over runner for the running flag (assigned below).
+function defaultKeyboard(sk) {
+  return tgkb.defaultKeyboard({
+    hasSession: !!state.getSession(sk),
+    running: runner.isRunning(sk),
+    hasDetails: !!state.getLastResponse(sk)?.details,
   });
-  return r.json();
+}
+function questionKeyboard(sk) {
+  return tgkb.questionKeyboard(defaultKeyboard(sk));
 }
 
-async function sendChunked(chatId, text, { code = false, markup, threadId } = {}) {
-  if (!text) text = '(empty)';
-  const wrap = code ? (s) => '```\n' + s + '\n```' : (s) => s;
-  const limit = code ? 3900 : 4000;
-  const chunks = [];
-  for (let i = 0; i < text.length; i += limit) chunks.push(text.slice(i, i + limit));
-  for (let i = 0; i < chunks.length; i++) {
-    const isLast = i === chunks.length - 1;
-    await tg('sendMessage', {
-      chat_id: chatId,
-      message_thread_id: threadId || undefined,
-      text: wrap(chunks[i]),
-      parse_mode: code ? 'MarkdownV2' : undefined,
-      disable_web_page_preview: true,
-      reply_markup: isLast && markup ? markup : undefined,
-    });
-  }
-}
+const runner = makeRunner({
+  exec, state, tg: telegram, supervisor,
+  keyboards: { defaultKeyboard, questionKeyboard },
+  ensureHook: hookInstaller.ensureHook,
+  deps: {
+    TARGET_CONTAINER, HOOK_PATH, BOT_URL_FOR_HOOK, HOOK_SECRET,
+    API_TIMEOUT_MS, BASH_DEFAULT_TIMEOUT_MS, BASH_MAX_TIMEOUT_MS, CLAUDE_TIMEOUT_MS,
+  },
+});
+const { runAndSend, handleStop } = runner;
 
-// Auto-create (once) a forum topic per job name so each repo's reports land in their
-// own thread instead of one blurred feed. Caches the id; caches 0 when the chat is not
-// a forum (no rights / not a supergroup-with-topics) so we fall back to flat and never
-// retry. Returns a message_thread_id, or undefined to send flat (today's behavior).
-async function topicFor(chatId, name) {
-  if (!name) return undefined;
-  const cached = state.getTopic(chatId, name);
-  if (cached !== undefined) return cached || undefined; // 0 -> flat
-  const r = await tg('createForumTopic', { chat_id: chatId, name: String(name).slice(0, 128) }).catch(() => null);
-  const id = (r && r.ok && r.result && r.result.message_thread_id) || 0;
-  state.setTopic(chatId, name, id); // 0 = flat (not a forum / no rights)
-  return id || undefined;
+// sk -> { token, container, target } — set when user taps ✏️ Reply; next msg goes to tmux.
+const replyPending = new Map();
+
+function authorized(from) {
+  if (!from) return false;
+  if (ALLOWED_USER_ID && from.id === ALLOWED_USER_ID) return true;
+  if (ALLOWED_USERNAME && from.username && from.username.toLowerCase() === ALLOWED_USERNAME.toLowerCase()) return true;
+  return false;
 }
 
 // ── Image/file handling ───────────────────────────────────────────
-
 const EXT_BY_MIME = {
   'image/jpeg': '.jpg',
   'image/png': '.png',
@@ -108,34 +104,11 @@ const EXT_BY_MIME = {
   'image/gif': '.gif',
 };
 
-async function downloadTgFile(fileId, ext = '.bin') {
-  const gf = await tg('getFile', { file_id: fileId });
-  if (!gf.ok) return { error: gf.description || 'getFile failed' };
-  const tgPath = gf.result.file_path;
-  const url = `https://api.telegram.org/file/bot${TOKEN}/${tgPath}`;
-  const res = await fetch(url);
-  if (!res.ok) return { error: `download ${res.status}` };
-  const buf = Buffer.from(await res.arrayBuffer());
-  const stem = `herald-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;
-  const localPath = `/tmp/${stem}`;
-  fs.writeFileSync(localPath, buf);
-  // Copy into target container at the same path so claude can Read it.
-  try {
-    await execFileP('docker', ['cp', localPath, `${TARGET_CONTAINER}:${localPath}`]);
-    await execFileP('docker', ['exec', '-u', 'root', TARGET_CONTAINER, 'chmod', '644', localPath]);
-  } catch (e) {
-    return { error: `copy to target failed: ${String(e.message).slice(0, 200)}` };
-  } finally {
-    try { fs.unlinkSync(localPath); } catch {}
-  }
-  return { path: localPath, bytes: buf.length };
-}
-
 async function handleImageMessage(msg, fileId, mime, captionOverride) {
   const chatId = msg.chat.id;
   const threadId = msg.message_thread_id;
   const sk = topicKey(chatId, threadId);
-  if (runningProcs.has(sk)) {
+  if (runner.isRunning(sk)) {
     return sendChunked(chatId, '⏳ Task running — image NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
   }
   await tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'upload_photo' });
@@ -148,336 +121,7 @@ async function handleImageMessage(msg, fileId, mime, captionOverride) {
   await runAndSend(chatId, prompt, sk, threadId);
 }
 
-function authorized(from) {
-  if (!from) return false;
-  if (ALLOWED_USER_ID && from.id === ALLOWED_USER_ID) return true;
-  if (ALLOWED_USERNAME && from.username && from.username.toLowerCase() === ALLOWED_USERNAME.toLowerCase()) return true;
-  return false;
-}
-
-// ── Keyboards ─────────────────────────────────────────────────────
-
-function defaultKeyboard(sk) {
-  const hasSession = !!state.getSession(sk);
-  const running = runningProcs.has(sk);
-  const hasDetails = !!state.getLastResponse(sk)?.details;
-  const row1 = [];
-  if (hasDetails) row1.push({ text: '📖 Details', callback_data: 'details' });
-  if (hasSession && !running) row1.push({ text: '➡️ Continue', callback_data: 'continue' });
-  const row2 = [];
-  if (running) row2.push({ text: '🛑 Stop', callback_data: 'stop' });
-  if (hasSession && !running) row2.push({ text: '🆕 New', callback_data: 'new' });
-  row2.push({ text: '⚙️ Settings', callback_data: 'settings' });
-  const rows = [];
-  if (row1.length) rows.push(row1);
-  if (row2.length) rows.push(row2);
-  return rows.length ? { inline_keyboard: rows } : undefined;
-}
-
-// True when a reply ends in a yes/no-style question (not a wh- question), so we offer
-// one-tap ✅/❌ instead of making the operator type back.
-function detectYesNo(text) {
-  const tail = text.slice(-600);
-  const m = tail.match(/([^\n.!?]*\?)\s*(?:\[.*?\])?\s*$/);
-  if (!m) return false;
-  const q = m[1].trim().toLowerCase();
-  return !/^(which|what|how|when|where|who|why)\b/.test(q);
-}
-
-// Yes/No row prepended above the normal controls. Scoped per sk like defaultKeyboard.
-function questionKeyboard(sk) {
-  const base = defaultKeyboard(sk);
-  const baseRows = base?.inline_keyboard ?? [];
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Yes', callback_data: 'confirm:y' },
-        { text: '❌ No', callback_data: 'confirm:n' },
-      ],
-      ...baseRows,
-    ],
-  };
-}
-
-function approvalKeyboard(requestId) {
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Approve', callback_data: `appr:y:${requestId}` },
-        { text: '❌ Deny', callback_data: `appr:n:${requestId}` },
-      ],
-    ],
-  };
-}
-
-function notifyKeyboard(token) {
-  return {
-    inline_keyboard: [
-      [
-        { text: '1', callback_data: `notif:k:1:${token}` },
-        { text: '2', callback_data: `notif:k:2:${token}` },
-        { text: '3', callback_data: `notif:k:3:${token}` },
-      ],
-      [
-        { text: '✏️ Reply', callback_data: `notif:reply:${token}` },
-        { text: '⛔ Esc', callback_data: `notif:esc:${token}` },
-      ],
-    ],
-  };
-}
-
-// ── Blocking-decision (ASK) queue ─────────────────────────────────
-// The agent emits <<ASK>>[{q,opts[]}]<<END>> when blocked on the operator; we ask
-// one question at a time with numbered buttons, collect, then resume the session.
-const ASK_INSTRUCTION = `When you are blocked and need the operator to make one or more decisions, end your reply with a single machine-readable block (and a short human summary BEFORE it):
-<<ASK>>
-[{"q":"<question>","opts":["<choice 1>","<choice 2>"]}]
-<<END>>
-One object per decision, 2-4 short opts each. Only emit it when genuinely blocked on the operator.`;
-
-const askQueues = new Map();       // sk -> { items:[{q,opts}], answers:[], idx }
-const askPendingOther = new Map(); // sk -> idx awaiting a typed custom answer
-
-function parseAsk(text) {
-  const m = (text || '').match(/<<ASK>>\s*([\s\S]*?)\s*<<END>>/);
-  if (!m) return null;
-  try {
-    const arr = JSON.parse(m[1]);
-    if (!Array.isArray(arr)) return null;
-    return arr
-      .filter((x) => x && x.q && Array.isArray(x.opts) && x.opts.length)
-      .map((x) => ({ q: String(x.q), opts: x.opts.slice(0, 4).map(String) }));
-  } catch { return null; }
-}
-function stripAsk(text) { return (text || '').replace(/<<ASK>>[\s\S]*?<<END>>/g, '').trim(); }
-
-function askKeyboard(items, idx) {
-  const rows = items[idx].opts.map((o, i) => [{ text: `${i + 1} · ${o}`.slice(0, 60), callback_data: `ask:${idx}:${i}` }]);
-  rows.push([{ text: '✏️ Other', callback_data: `ask:${idx}:x` }]);
-  return { inline_keyboard: rows };
-}
-async function presentAsk(chatId, sk, threadId) {
-  const q = askQueues.get(sk);
-  if (!q) return;
-  const item = q.items[q.idx];
-  await sendChunked(chatId, `❓ Q${q.idx + 1}/${q.items.length}: ${item.q}`, { threadId, markup: askKeyboard(q.items, q.idx) });
-}
-function startAskQueue(chatId, sk, threadId, items) {
-  askQueues.set(sk, { items, answers: [], idx: 0 });
-  return presentAsk(chatId, sk, threadId);
-}
-async function advanceAsk(chatId, sk, threadId) {
-  const q = askQueues.get(sk);
-  if (!q) return;
-  q.idx += 1;
-  if (q.idx < q.items.length) return presentAsk(chatId, sk, threadId);
-  askQueues.delete(sk);
-  const compiled = q.items.map((it, i) => `${i + 1}. ${it.q} → ${q.answers[i]}`).join('\n');
-  await sendChunked(chatId, `Got it:\n${compiled}`, { threadId });
-  return runAndSend(chatId, `My decisions:\n${compiled}`, sk, threadId);
-}
-
-// Send keystrokes into an interactive Claude session running in tmux inside a container.
-// `text` is appended with Enter unless it's the literal sentinel 'ESC' (sent as Escape key).
-async function sendTmuxKeys(container, target, text) {
-  // Pin the container — never trust a client-supplied one — and validate the
-  // target against the known herald-tmux scheme before injecting keystrokes.
-  if (!TMUX_TARGET_RE.test(String(target || ''))) {
-    throw new Error(`refusing send-keys to unknown tmux target: ${target}`);
-  }
-  const args = ['exec', '-u', TARGET_USER, TARGET_CONTAINER, 'tmux', 'send-keys', '-t', target];
-  if (text === 'ESC') {
-    args.push('Escape');
-  } else {
-    args.push(text, 'Enter');
-  }
-  await execFileP('docker', args);
-}
-
-// ── Claude invocation ─────────────────────────────────────────────
-
-// ── Autonomous supervisor hand-off (Phalanx no-babysit) ───────────
-
-// True if cwd/TASKS.md has at least one open "- [ ]" item in the target container.
-async function repoHasOpenTasks(cwd) {
-  try {
-    await execFileP('docker', ['exec', '-u', TARGET_USER, TARGET_CONTAINER,
-      'bash', '-c', 'grep -Eq "^[[:space:]]*-[[:space:]]*\\[ \\]" "$1"/TASKS.md', '_', cwd]);
-    return true;            // grep -q exit 0 = an open task remains
-  } catch { return false; } // exit 1 (no open tasks) or no TASKS.md
-}
-
-// Launch the detached supervisor in the target container; it relaunches fresh
-// `claude -p "/work"` passes until the backlog is done/BLOCKED, posting status to
-// our /event endpoint (-> Telegram). Idempotent: supervisord refuses a second one.
-async function launchSupervisor(cwd, chatId) {
-  const notifyUrl = `${BOT_URL_FOR_HOOK}/event${chatId ? `?chatId=${chatId}` : ''}`;
-  await execFileP('docker', ['exec', '-u', TARGET_USER,
-    '-e', `PHALANX_NOTIFY_URL=${notifyUrl}`,
-    '-e', `PHALANX_NOTIFY_SECRET=${HOOK_SECRET}`,
-    '-e', 'PATH=/home/cc/.npm-global/bin:/usr/local/bin:/usr/bin:/bin',
-    TARGET_CONTAINER, 'bash', SUPERVISORD_PATH, 'start', '-r', cwd]);
-}
-
-// After an inline run, if work is unfinished (open tasks remain, or it timed out),
-// hand the repo to the supervisor and tell the user. No-op when nothing's pending.
-async function maybeEscalate(chatId, sk, threadId, reason) {
-  if (!AUTO_ESCALATE) return false;
-  const cwd = state.getRepo(sk);
-  if (!(await repoHasOpenTasks(cwd))) return false;
-  try { await launchSupervisor(cwd, chatId); }
-  catch (e) { console.error('supervisor launch failed:', e); return false; }
-  await sendChunked(chatId,
-    `🤖 Didn't finish in one pass (${reason}). Handed to the autonomous supervisor — ` +
-    `it'll drive it to done across fresh sessions and message you on progress / done / blocked.`,
-    { markup: defaultKeyboard(sk), threadId });
-  return true;
-}
-
-function runClaude(prompt, chatId, sk, threadId) {
-  const sessionId = state.getSession(sk);
-  const model = state.getModel(sk);
-  const mode = state.getMode(sk);
-  const cwd = state.getRepo(sk);
-
-  return new Promise((resolve, reject) => {
-    const claudeArgs = [
-      '-p',
-      '--output-format', 'json',
-      '--model', model,
-      '--append-system-prompt', `${TLDR_INSTRUCTION}\n\n${ASK_INSTRUCTION}`,
-    ];
-    if (sessionId) claudeArgs.push('--resume', sessionId);
-
-    // Inject our PreToolUse hook via --settings JSON
-    const hookSettings = {
-      hooks: {
-        PreToolUse: [
-          {
-            matcher: '',
-            hooks: [{ type: 'command', command: HOOK_PATH }],
-          },
-        ],
-      },
-    };
-    claudeArgs.push('--settings', JSON.stringify(hookSettings));
-
-    // Always bypass CC's built-in prompts so OUR PreToolUse hook is the sole gate; the
-    // mode (strict/guided/yolo) is passed through via HERALD_MODE and enforced by the hook.
-    claudeArgs.push('--permission-mode', 'bypassPermissions');
-
-    const dockerArgs = [
-      'exec', '-i',
-      '-u', TARGET_USER,
-      '-w', cwd,
-      '-e', `HERALD_CHAT_ID=${chatId}`,
-      '-e', `HERALD_MODE=${mode}`,
-      '-e', `HERALD_URL=${BOT_URL_FOR_HOOK}`,
-      '-e', `HERALD_HOOK_SECRET=${HOOK_SECRET}`,
-      '-e', `APPROVAL_TIMEOUT_SECONDS=${process.env.APPROVAL_TIMEOUT_SECONDS || 300}`,
-      '-e', 'PATH=/home/cc/.npm-global/bin:/usr/local/bin:/usr/bin:/bin',
-      '-e', `API_TIMEOUT_MS=${API_TIMEOUT_MS}`,
-      '-e', `BASH_DEFAULT_TIMEOUT_MS=${BASH_DEFAULT_TIMEOUT_MS}`,
-      '-e', `BASH_MAX_TIMEOUT_MS=${BASH_MAX_TIMEOUT_MS}`,
-      TARGET_CONTAINER,
-      'claude', ...claudeArgs,
-    ];
-
-    const child = spawn('docker', dockerArgs);
-    const rec = runningProcs.get(sk) || {};
-    rec.child = child;
-    rec.startedAt = rec.startedAt || Date.now();
-    runningProcs.set(sk, rec);
-    child.stdin.on('error', () => {});
-    try { child.stdin.write(prompt); child.stdin.end(); } catch {}
-
-    let out = '', err = '';
-    let timedOut = false;
-    const killTimer = CLAUDE_TIMEOUT_MS > 0 ? setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-      reject(new Error(`claude timed out after ${CLAUDE_TIMEOUT_MS}ms`));
-    }, CLAUDE_TIMEOUT_MS) : null;
-
-    child.stdout.on('data', (d) => { out += d.toString(); });
-    child.stderr.on('data', (d) => { err += d.toString(); });
-    child.on('error', (e) => { clearTimeout(killTimer); runningProcs.delete(sk); reject(e); });
-    child.on('close', (code, signal) => {
-      clearTimeout(killTimer);
-      const wasStopped = runningProcs.get(sk)?.stopRequested;
-      runningProcs.delete(sk);
-      if (timedOut) return;
-      if (wasStopped || signal === 'SIGTERM' || signal === 'SIGKILL' || code === 137 || code === 143) {
-        return reject(new Error('stopped'));
-      }
-      if (code !== 0) {
-        return reject(new Error(`claude exit ${code}\nstderr: ${err.slice(0, 2000)}\nstdout: ${out.slice(0, 500)}`));
-      }
-      try { resolve(JSON.parse(out)); }
-      catch (e) { reject(new Error(`json parse failed: ${e.message}\nfirst 1k: ${out.slice(0, 1000)}`)); }
-    });
-  });
-}
-
-async function runAndSend(chatId, prompt, sk, threadId) {
-  // Reserve the slot SYNCHRONOUSLY before any await — two rapid messages could both
-  // pass an upstream runningProcs.has() check otherwise (awaits in runClaude widen the
-  // TOCTOU window). runClaude attaches the child to this placeholder; every exit path
-  // deletes it (success/error/stopped).
-  if (runningProcs.has(sk)) {
-    return sendChunked(chatId, '⏳ Task running — message NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
-  }
-  runningProcs.set(sk, { startedAt: Date.now() });
-  await ensureHook();
-  askQueues.delete(sk); askPendingOther.delete(sk);
-  await tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' });
-  const heartbeat = setInterval(() => {
-    tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' }).catch(() => {});
-  }, 4000);
-  try {
-    const result = await runClaude(prompt, chatId, sk, threadId);
-    state.setSession(sk, result.session_id);
-    const body = result.result ?? JSON.stringify(result, null, 2);
-    const { tldr, details } = splitTldr(body);
-    state.setLastResponse(sk, { tldr, details, model: state.getModel(sk) });
-    const ask = parseAsk(body);
-    if (ask && ask.length) {
-      const preface = stripAsk(tldr);
-      if (preface) await sendChunked(chatId, preface, { threadId });
-      return startAskQueue(chatId, sk, threadId, ask);
-    }
-    const markup = detectYesNo(tldr) ? questionKeyboard(sk) : defaultKeyboard(sk);
-    await sendChunked(chatId, tldr + costFooter(result, state.getModel(sk)), { markup, threadId });
-    // No success-path escalation: a normal completed turn must NOT hand the repo to the
-    // supervisor just because TASKS.md has unrelated open items. Only genuinely
-    // unfinished runs (timeout/limit) escalate — see the timed-out branch below.
-  } catch (e) {
-    if (e.message === 'stopped') {
-      await sendChunked(chatId, '🛑 Stopped.', { markup: defaultKeyboard(sk), threadId });
-    } else {
-      console.error('claude error:', e);
-      const full = e.message;
-      const containerDown = /container .* is not running|No such container/.test(full);
-      let summary;
-      if (containerDown) summary = `⚠️ ${TARGET_CONTAINER} not running.`;
-      else if (full.includes('timed out')) summary = `⏱️ Timed out after ${Math.round(CLAUDE_TIMEOUT_MS / 60000)} min.`;
-      else summary = `⚠️ Claude errored. Tap 📖 Details for full trace.`;
-      state.setLastResponse(sk, { tldr: summary, details: full, model: state.getModel(sk) });
-      await sendChunked(chatId, summary, { markup: defaultKeyboard(sk), threadId });
-      if (full.includes('timed out')) await maybeEscalate(chatId, sk, threadId, 'timed out');
-    }
-  } finally {
-    clearInterval(heartbeat);
-    // Defensive: ensure no placeholder is left if runClaude bailed before spawn.
-    runningProcs.delete(sk);
-  }
-}
-
-// ── Approval flow ─────────────────────────────────────────────────
-
-// sk -> { token, container, target, msgId } — set when user taps ✏️ Reply; next msg goes to tmux.
-const replyPending = new Map();
-
+// ── Approval-server handlers ──────────────────────────────────────
 approval.setChatIdResolver(() => state.get().knownUserId);
 
 // Phalanx supervisor status events -> plain Telegram message (no Reply button).
@@ -496,9 +140,8 @@ approval.setEventHandler(async ({ chatId, event, message, repo, thread }) => {
 });
 
 approval.setNotifyHandler(async ({ token, chatId, message, container, tmuxTarget, cwd }) => {
-  // The hook may have reported its container's hostname (which often != docker container name).
-  // Single-target bot owns the source-of-truth: rewrite token's container to TARGET_CONTAINER so
-  // downstream send-keys hits the right place regardless of what the hook guessed.
+  // Single-target bot owns the source-of-truth: rewrite token's container to
+  // TARGET_CONTAINER so downstream send-keys hits the right place.
   if (container !== TARGET_CONTAINER) {
     approval.rewriteNotifyContainer(token, TARGET_CONTAINER);
   }
@@ -511,7 +154,7 @@ approval.setNotifyHandler(async ({ token, chatId, message, container, tmuxTarget
   await tg('sendMessage', {
     chat_id: chatId,
     text,
-    reply_markup: notifyKeyboard(token),
+    reply_markup: tgkb.notifyKeyboard(token),
     disable_web_page_preview: true,
   });
 });
@@ -531,22 +174,11 @@ approval.setApprovalHandler(async ({ requestId, chatId, toolName, command, cwd, 
     chat_id: chatId,
     text: lines,
     parse_mode: 'Markdown',
-    reply_markup: approvalKeyboard(requestId),
+    reply_markup: tgkb.approvalKeyboard(requestId),
   });
 });
 
-// ── Commands ──────────────────────────────────────────────────────
-
-function handleStop(chatId, sk, threadId) {
-  const rec = runningProcs.get(sk);
-  if (!rec) return sendChunked(chatId, 'Nothing running.', { markup: defaultKeyboard(sk), threadId });
-  rec.stopRequested = true;
-  if (!rec.child) { runningProcs.delete(sk); return sendChunked(chatId, '🛑 Stopped (was starting).', { markup: defaultKeyboard(sk), threadId }); }
-  rec.child.kill('SIGTERM');
-  setTimeout(() => { try { rec.child.kill('SIGKILL'); } catch {} }, 3000);
-  return sendChunked(chatId, '🛑 Stop sent.', { threadId });
-}
-
+// ── Command handlers ──────────────────────────────────────────────
 async function handleSettings(chatId, sk, threadId) {
   const { text, markup } = settings.settingsMenu(sk);
   return sendChunked(chatId, text, { markup, threadId });
@@ -582,6 +214,7 @@ async function handleRepo(chatId, arg, sk, threadId) {
   return sendChunked(chatId, `Repo → ${arg}`, { markup: defaultKeyboard(sk), threadId });
 }
 
+// ── Message dispatch ──────────────────────────────────────────────
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
   const threadId = msg.message_thread_id;
@@ -610,7 +243,7 @@ async function handleMessage(msg) {
   }
   // Generic (non-image) document: download, copy into target container, hand to Claude.
   if (msg.document) {
-    if (runningProcs.has(sk)) {
+    if (runner.isRunning(sk)) {
       return sendChunked(chatId, '⏳ Task running — file NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
     }
     const doc = msg.document;
@@ -632,10 +265,10 @@ async function handleMessage(msg) {
   const text = (msg.text || '').trim();
   if (!text) return;
   // ASK 'Other': a typed answer for a pending custom decision.
-  if (askPendingOther.has(sk)) {
-    const i = askPendingOther.get(sk); askPendingOther.delete(sk);
-    const q = askQueues.get(sk);
-    if (q) { q.answers[i] = text; return advanceAsk(chatId, sk, threadId); }
+  if (runner.hasPendingOther(sk)) {
+    const i = runner.takePendingOther(sk);
+    const q = runner.getAsk(sk);
+    if (q) { q.answers[i] = text; return runner.advanceAsk(chatId, sk, threadId); }
   }
 
   if (text === '/start' || text === '/help') {
@@ -664,12 +297,12 @@ async function handleMessage(msg) {
   }
   if (text === '/stop') return handleStop(chatId, sk, threadId);
   if (text === '/continue') {
-    if (runningProcs.has(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
+    if (runner.isRunning(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
     if (!state.getSession(sk)) return sendChunked(chatId, 'No session. Send a message to start.', { threadId });
     return runAndSend(chatId, 'continue', sk, threadId);
   }
   if (text === '/status') {
-    const running = runningProcs.has(sk);
+    const running = runner.isRunning(sk);
     return sendChunked(chatId,
       `mode: ${settings.MODE_LABELS[state.getMode(sk)]}\n` +
       `model: ${state.getModel(sk)}\n` +
@@ -692,7 +325,7 @@ async function handleMessage(msg) {
     }
     replyPending.delete(sk);
     try {
-      await sendTmuxKeys(pendingReply.container, pendingReply.target, text);
+      await exec.sendTmuxKeys(pendingReply.container, pendingReply.target, text);
       approval.deleteNotifyToken(pendingReply.token);
       return sendChunked(chatId, `✉️ Sent → ${pendingReply.target}`, { markup: defaultKeyboard(sk), threadId });
     } catch (e) {
@@ -700,14 +333,13 @@ async function handleMessage(msg) {
     }
   }
 
-  if (runningProcs.has(sk)) {
+  if (runner.isRunning(sk)) {
     return sendChunked(chatId, '⏳ Task running — message NOT sent. Stop first.', { markup: defaultKeyboard(sk), threadId });
   }
   await runAndSend(chatId, text, sk, threadId);
 }
 
-// ── Callback queries ──────────────────────────────────────────────
-
+// ── Callback dispatch ─────────────────────────────────────────────
 async function handleCallback(cb) {
   const chatId = cb.message?.chat?.id;
   if (!chatId) return;
@@ -717,169 +349,126 @@ async function handleCallback(cb) {
   if (!authorized(cb.from)) {
     return tg('answerCallbackQuery', { callback_query_id: cb.id, text: 'Unauthorized', show_alert: true });
   }
-  const data = cb.data || '';
+  const msgId = cb.message.message_id;
   await tg('answerCallbackQuery', { callback_query_id: cb.id });
+  const ev = decode(cb.data || '');
 
-  if (data === 'details') {
-    const last = state.getLastResponse(sk);
-    if (!last?.details) return sendChunked(chatId, '(no details)', { threadId });
-    return sendChunked(chatId, last.details, { markup: defaultKeyboard(sk), threadId });
-  }
-  if (data.startsWith('confirm:')) {
-    if (runningProcs.has(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
-    const answer = data === 'confirm:y' ? 'Yes' : 'No';
-    await tg('editMessageReplyMarkup', {
-      chat_id: chatId,
-      message_id: cb.message.message_id,
-      reply_markup: { inline_keyboard: [[{ text: data === 'confirm:y' ? '✅ Yes' : '❌ No', callback_data: 'noop' }]] },
-    });
-    return runAndSend(chatId, answer, sk, threadId);
-  }
-  if (data.startsWith('ask:')) {
-    const q = askQueues.get(sk);
-    if (!q) return;
-    const [, idxStr, pick] = data.split(':');
-    const idx = Number(idxStr);
-    if (idx !== q.idx) return;
-    if (pick === 'x') {
-      askPendingOther.set(sk, idx);
-      await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: '✏️ type your answer…', callback_data: 'noop' }]] } });
-      return sendChunked(chatId, `Type your answer for Q${idx + 1}.`, { threadId });
+  switch (ev.kind) {
+    case 'details': {
+      const last = state.getLastResponse(sk);
+      if (!last?.details) return sendChunked(chatId, '(no details)', { threadId });
+      return sendChunked(chatId, last.details, { markup: defaultKeyboard(sk), threadId });
     }
-    const chosen = q.items[idx].opts[Number(pick)];
-    if (chosen == null) return;
-    q.answers[idx] = chosen;
-    await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: `✅ ${chosen}`.slice(0, 60), callback_data: 'noop' }]] } });
-    return advanceAsk(chatId, sk, threadId);
+    case 'confirm': {
+      if (runner.isRunning(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
+      await tg('editMessageReplyMarkup', {
+        chat_id: chatId, message_id: msgId,
+        reply_markup: { inline_keyboard: [[{ text: ev.answer === 'Yes' ? '✅ Yes' : '❌ No', callback_data: 'noop' }]] },
+      });
+      return runAndSend(chatId, ev.answer, sk, threadId);
+    }
+    case 'ask': {
+      const q = runner.getAsk(sk);
+      if (!q) return;
+      if (ev.idx !== q.idx) return;
+      if (ev.pick === 'x') {
+        runner.setPendingOther(sk, ev.idx);
+        await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '✏️ type your answer…', callback_data: 'noop' }]] } });
+        return sendChunked(chatId, `Type your answer for Q${ev.idx + 1}.`, { threadId });
+      }
+      const chosen = q.items[ev.idx].opts[Number(ev.pick)];
+      if (chosen == null) return;
+      q.answers[ev.idx] = chosen;
+      await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: `✅ ${chosen}`.slice(0, 60), callback_data: 'noop' }]] } });
+      return runner.advanceAsk(chatId, sk, threadId);
+    }
+    case 'continue': {
+      if (runner.isRunning(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
+      if (!state.getSession(sk)) return sendChunked(chatId, 'No session.', { threadId });
+      return runAndSend(chatId, 'continue', sk, threadId);
+    }
+    case 'new': {
+      state.clearSession(sk);
+      return sendChunked(chatId, '🆕 New session.', { markup: defaultKeyboard(sk), threadId });
+    }
+    case 'stop': return handleStop(chatId, sk, threadId);
+    case 'settings': return handleSettings(chatId, sk, threadId);
+    case 'menu:close':
+      return tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [] } });
+    case 'mode': {
+      if (!settings.MODES.includes(ev.value)) return;
+      state.setMode(sk, ev.value);
+      const { text, markup } = settings.settingsMenu(sk);
+      return tg('editMessageText', { chat_id: chatId, message_id: msgId, text, reply_markup: markup });
+    }
+    case 'model': {
+      if (!settings.MODELS.includes(ev.value)) return;
+      state.setModel(sk, ev.value);
+      const { text, markup } = settings.settingsMenu(sk);
+      return tg('editMessageText', { chat_id: chatId, message_id: msgId, text, reply_markup: markup });
+    }
+    case 'appr': {
+      const handled = approval.respondTo(ev.requestId, ev.ok, ev.ok ? null : 'denied by user');
+      const status = ev.ok ? '✅ Approved' : '❌ Denied';
+      await tg('editMessageReplyMarkup', {
+        chat_id: chatId, message_id: msgId,
+        reply_markup: { inline_keyboard: [[{ text: `${status} — request closed`, callback_data: 'noop' }]] },
+      });
+      if (!handled) await sendChunked(chatId, '(request already closed or timed out)', { threadId });
+      return;
+    }
+    case 'notif': return handleNotif(ev, cb, chatId, sk, threadId, msgId);
+    case 'pr': return handlePrCallback(ev, chatId, sk, threadId);
+    default: return;
   }
-  if (data === 'continue') {
-    if (runningProcs.has(sk)) return sendChunked(chatId, '⏳ Already running.', { threadId });
-    if (!state.getSession(sk)) return sendChunked(chatId, 'No session.', { threadId });
-    return runAndSend(chatId, 'continue', sk, threadId);
-  }
-  if (data === 'new') {
-    state.clearSession(sk);
-    return sendChunked(chatId, '🆕 New session.', { markup: defaultKeyboard(sk), threadId });
-  }
-  if (data === 'stop') return handleStop(chatId, sk, threadId);
-  if (data === 'settings') return handleSettings(chatId, sk, threadId);
-  if (data === 'menu:close') {
-    return tg('editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] } });
-  }
-  if (data.startsWith('mode:')) {
-    const m = data.slice(5);
-    if (!settings.MODES.includes(m)) return;
-    state.setMode(sk, m);
-    const { text, markup } = settings.settingsMenu(sk);
-    return tg('editMessageText', {
-      chat_id: chatId,
-      message_id: cb.message.message_id,
-      text,
-      reply_markup: markup,
-    });
-  }
-  if (data.startsWith('model:')) {
-    const m = data.slice(6);
-    if (!settings.MODELS.includes(m)) return;
-    state.setModel(sk, m);
-    const { text, markup } = settings.settingsMenu(sk);
-    return tg('editMessageText', {
-      chat_id: chatId,
-      message_id: cb.message.message_id,
-      text,
-      reply_markup: markup,
-    });
-  }
-  if (data.startsWith('appr:')) {
-    const [, verdict, requestId] = data.split(':');
-    const ok = verdict === 'y';
-    const handled = approval.respondTo(requestId, ok, ok ? null : 'denied by user');
-    const status = ok ? '✅ Approved' : '❌ Denied';
-    await tg('editMessageReplyMarkup', {
-      chat_id: chatId,
-      message_id: cb.message.message_id,
-      reply_markup: { inline_keyboard: [[{ text: `${status} — request closed`, callback_data: 'noop' }]] },
-    });
-    if (!handled) await sendChunked(chatId, '(request already closed or timed out)', { threadId });
+}
+
+async function handleNotif(ev, cb, chatId, sk, threadId, msgId) {
+  const rec = approval.getNotifyToken(ev.token);
+  if (!rec) {
+    await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '(expired)', callback_data: 'noop' }]] } });
     return;
   }
-  if (data.startsWith('notif:')) {
-    const parts = data.split(':');
-    const verb = parts[1];
-    const token = parts[parts.length - 1];
-    const rec = approval.getNotifyToken(token);
-    if (!rec) {
-      await tg('editMessageReplyMarkup', {
-        chat_id: chatId,
-        message_id: cb.message.message_id,
-        reply_markup: { inline_keyboard: [[{ text: '(expired)', callback_data: 'noop' }]] },
-      });
-      return;
-    }
-    if (verb === 'k') {
-      const key = parts[2];
-      try {
-        await sendTmuxKeys(rec.container, rec.target, key);
-        approval.deleteNotifyToken(token);
-        await tg('editMessageReplyMarkup', {
-          chat_id: chatId,
-          message_id: cb.message.message_id,
-          reply_markup: { inline_keyboard: [[{ text: `↳ sent "${key}"`, callback_data: 'noop' }]] },
-        });
-      } catch (e) {
-        await sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`, { threadId });
-      }
-      return;
-    }
-    if (verb === 'esc') {
-      try {
-        await sendTmuxKeys(rec.container, rec.target, 'ESC');
-        approval.deleteNotifyToken(token);
-        await tg('editMessageReplyMarkup', {
-          chat_id: chatId,
-          message_id: cb.message.message_id,
-          reply_markup: { inline_keyboard: [[{ text: '↳ sent Esc', callback_data: 'noop' }]] },
-        });
-      } catch (e) {
-        await sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`, { threadId });
-      }
-      return;
-    }
-    if (verb === 'reply') {
-      replyPending.set(sk, { token, container: rec.container, target: rec.target });
-      await tg('editMessageReplyMarkup', {
-        chat_id: chatId,
-        message_id: cb.message.message_id,
-        reply_markup: { inline_keyboard: [[{ text: '✏️ waiting for your reply…  /cancel to abort', callback_data: 'noop' }]] },
-      });
-      return;
+  if (ev.verb === 'k') {
+    try {
+      await exec.sendTmuxKeys(rec.container, rec.target, ev.key);
+      approval.deleteNotifyToken(ev.token);
+      await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: `↳ sent "${ev.key}"`, callback_data: 'noop' }]] } });
+    } catch (e) {
+      await sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`, { threadId });
     }
     return;
   }
-  if (data.startsWith('pr:view:')) {
-    const num = data.split(':')[2];
-    return handlePr(chatId, num, sk, threadId);
+  if (ev.verb === 'esc') {
+    try {
+      await exec.sendTmuxKeys(rec.container, rec.target, 'ESC');
+      approval.deleteNotifyToken(ev.token);
+      await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '↳ sent Esc', callback_data: 'noop' }]] } });
+    } catch (e) {
+      await sendChunked(chatId, `⚠️ send-keys failed: ${String(e.message).slice(0, 300)}`, { threadId });
+    }
+    return;
   }
-  if (data.startsWith('pr:review:')) {
-    const num = data.split(':')[2];
-    return runAndSend(chatId, `/review ${num}`, sk, threadId);
+  if (ev.verb === 'reply') {
+    replyPending.set(sk, { token: ev.token, container: rec.container, target: rec.target });
+    await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '✏️ waiting for your reply…  /cancel to abort', callback_data: 'noop' }]] } });
   }
-  if (data.startsWith('pr:approve:')) {
-    const num = data.split(':')[2];
-    const cwd = state.getRepo(sk);
-    const { ok, err } = await gh.approvePr(cwd, num);
-    return sendChunked(chatId, ok ? `✅ Approved PR #${num}` : `Failed: ${err.slice(0, 300)}`, { threadId });
+}
+
+async function handlePrCallback(ev, chatId, sk, threadId) {
+  if (ev.verb === 'view') return handlePr(chatId, ev.num, sk, threadId);
+  if (ev.verb === 'review') return runAndSend(chatId, `/review ${ev.num}`, sk, threadId);
+  if (ev.verb === 'approve') {
+    const { ok, err } = await gh.approvePr(state.getRepo(sk), ev.num);
+    return sendChunked(chatId, ok ? `✅ Approved PR #${ev.num}` : `Failed: ${err.slice(0, 300)}`, { threadId });
   }
-  if (data.startsWith('pr:merge:')) {
-    const num = data.split(':')[2];
-    const cwd = state.getRepo(sk);
-    const { ok, err } = await gh.mergePr(cwd, num);
-    return sendChunked(chatId, ok ? `🔀 Merged PR #${num}` : `Failed: ${err.slice(0, 300)}`, { threadId });
+  if (ev.verb === 'merge') {
+    const { ok, err } = await gh.mergePr(state.getRepo(sk), ev.num);
+    return sendChunked(chatId, ok ? `🔀 Merged PR #${ev.num}` : `Failed: ${err.slice(0, 300)}`, { threadId });
   }
 }
 
 // ── Boot ──────────────────────────────────────────────────────────
-
 async function registerCommands() {
   await tg('setMyCommands', {
     commands: [
@@ -897,48 +486,12 @@ async function registerCommands() {
   }).catch((e) => console.error('setMyCommands failed:', e));
 }
 
-async function copyAndChmod(src, dst) {
-  await execFileP('docker', ['cp', src, `${TARGET_CONTAINER}:${dst}`]);
-  await execFileP('docker', ['exec', '-u', 'root', TARGET_CONTAINER, 'chmod', '+x', dst]);
-}
-
-async function installHook() {
-  let ok = true;
-  try {
-    await copyAndChmod(HOOK_SRC, HOOK_PATH);
-    console.log(`hook installed: ${TARGET_CONTAINER}:${HOOK_PATH}`);
-  } catch (e) {
-    console.warn(`pretooluse hook install failed: ${String(e.message).slice(0, 200)}`);
-    ok = false;
-  }
-  // Notification hook + tmux launcher are best-effort — interactive-session feature only.
-  try {
-    await copyAndChmod(NOTIFY_HOOK_SRC, NOTIFY_HOOK_PATH);
-    console.log(`notify hook installed: ${TARGET_CONTAINER}:${NOTIFY_HOOK_PATH}`);
-  } catch (e) {
-    console.warn(`notify hook install failed: ${String(e.message).slice(0, 200)}`);
-  }
-  try {
-    await copyAndChmod(TMUX_LAUNCHER_SRC, TMUX_LAUNCHER_PATH);
-    console.log(`tmux launcher installed: ${TARGET_CONTAINER}:${TMUX_LAUNCHER_PATH}`);
-  } catch (e) {
-    console.warn(`tmux launcher install failed: ${String(e.message).slice(0, 200)}`);
-  }
-  return ok;
-}
-
-let hookInstalled = false;
-async function ensureHook() {
-  if (hookInstalled) return;
-  hookInstalled = await installHook();
-}
-
 let offset = 0;
 async function pollLoop() {
   console.log(`herald up; allowed=@${ALLOWED_USERNAME || ALLOWED_USER_ID} target=${TARGET_CONTAINER} (user=${TARGET_USER})`);
   registerCommands();
   approval.start(HOOK_SECRET);
-  ensureHook();
+  hookInstaller.ensureHook();
   const allowed = encodeURIComponent(JSON.stringify(['message', 'callback_query']));
   let backoff = 0; // consecutive-failure counter for exponential backoff
   const sleepFor = () => 1000 * Math.min(60, 2 ** backoff);
@@ -975,11 +528,11 @@ let shuttingDown = false;
 async function gracefulExit() {
   if (shuttingDown) return;
   shuttingDown = true;
-  const affected = [...runningProcs.entries()];
+  const affected = runner.runningEntries();
   for (const [, rec] of affected) {
     try { rec.child?.kill('SIGTERM'); } catch {}
   }
-  await Promise.allSettled(affected.map(([sk, rec]) => {
+  await Promise.allSettled(affected.map(([sk]) => {
     const chatId = String(sk).split(':')[0];
     const threadId = String(sk).includes(':') ? Number(String(sk).split(':')[1]) : undefined;
     return sendChunked(chatId, '⚠️ Herald restarted — your run was interrupted, tap Continue.', { markup: defaultKeyboard(sk), threadId }).catch(() => {});
