@@ -1,7 +1,7 @@
-# Example target container for cc-bot.
+# Example target container for herald.
 # Build:  docker build -t my-claude-rc -f claude-container.Dockerfile .
-# Then connect to the cc-bot network:
-#   docker network connect cc-bot-net my-claude-rc
+# Then connect to the herald network:
+#   docker network connect herald-net my-claude-rc
 
 FROM node:22-bookworm-slim
 

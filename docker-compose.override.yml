@@ -1,0 +1,11 @@
+# Site-local override: also attach herald to claude-stack_claude-net so it can
+# reach claude-code-rc (which lives on that network, created outside this project).
+services:
+  herald:
+    networks:
+      herald-net: {}
+      claude-stack_claude-net: {}
+
+networks:
+  claude-stack_claude-net:
+    external: true

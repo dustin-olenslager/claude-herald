@@ -1,4 +1,4 @@
-# cc-bot
+# herald
 
 **Drive Claude Code from your phone via Telegram.** PR-friendly. Strict / Guided / Yolo approval modes.
 
@@ -6,7 +6,7 @@ Send a message → it runs in your Claude Code container. Get a short summary ba
 
 ## Why
 
-Claude Code is amazing at the keyboard. But the moments you most want an AI dev — standing in line, walking the dog, lying in bed at 11pm thinking about that one bug — you don't have a keyboard. cc-bot fixes that.
+Claude Code is amazing at the keyboard. But the moments you most want an AI dev — standing in line, walking the dog, lying in bed at 11pm thinking about that one bug — you don't have a keyboard. herald fixes that.
 
 ## Features (v0.1)
 
@@ -21,8 +21,8 @@ Claude Code is amazing at the keyboard. But the moments you most want an AI dev 
 ## Quickstart (2 minutes)
 
 ```bash
-git clone https://github.com/dustin-olenslager/cc-bot.git
-cd cc-bot
+git clone https://github.com/dustin-olenslager/herald.git
+cd herald
 ./install.sh
 ```
 
@@ -34,7 +34,7 @@ The installer:
 4. Lets you pick a default mode (strict/guided/yolo)
 5. Detects your existing Claude container or builds a fresh one from [examples/claude-container.Dockerfile](./examples/claude-container.Dockerfile)
 6. Creates the docker network, wires it up
-7. Builds + starts cc-bot
+7. Builds + starts herald
 8. Prints your bot's `t.me/...` URL
 
 If the installer builds a fresh Claude container, you'll need to authenticate `claude` once:
@@ -51,14 +51,14 @@ Then open the printed Telegram link, send `/start`. You're driving.
 <summary>Click to expand</summary>
 
 ```bash
-git clone https://github.com/dustin-olenslager/cc-bot.git
-cd cc-bot
+git clone https://github.com/dustin-olenslager/herald.git
+cd herald
 cp .env.example .env
 # edit .env: BOT_TOKEN, ALLOWED_USERNAME, TARGET_CONTAINER
 
 # create network, connect your existing claude container
-docker network create cc-bot-net
-docker network connect cc-bot-net <your-claude-container-name>
+docker network create herald-net
+docker network connect herald-net <your-claude-container-name>
 
 docker compose up -d --build
 ```
@@ -68,7 +68,7 @@ Target container requirements:
 - `bash`, `curl`, `jq` (for the approval hook)
 - `gh` CLI (optional — needed for `/pr` commands)
 - A logged-in `claude` (run `claude` once for device-flow auth, or set `ANTHROPIC_API_KEY`)
-- Connected to the `cc-bot-net` docker network
+- Connected to the `herald-net` docker network
 
 </details>
 
@@ -123,7 +123,7 @@ Buttons under every reply: 📖 Details · ➡️ Continue · 🛑 Stop · 🆕 
         Telegram ─── BOT_TOKEN ───┐
                                   │
                             ┌─────▼─────┐
-                            │  cc-bot   │  (this repo)
+                            │  herald   │  (this repo)
                             │  Node 22  │
                             │           │ ◄── POST /approve ─── hook
                             └─────┬─────┘                       │
@@ -163,20 +163,20 @@ There's a second flow for the case where you **already have Claude open in a ter
    {
      "hooks": {
        "Notification": [
-         { "hooks": [{ "type": "command", "command": "/usr/local/bin/cc-bot-notify-tg.sh" }] }
+         { "hooks": [{ "type": "command", "command": "/usr/local/bin/herald-notify-tg.sh" }] }
        ]
      }
    }
    ```
-   The hook script and the launcher are installed automatically by cc-bot on startup (`docker cp` into the target container).
+   The hook script and the launcher are installed automatically by herald on startup (`docker cp` into the target container).
 
 ### Usage
 
 Launch Claude through the supplied tmux wrapper instead of running `claude` directly:
 
 ```bash
-cc-tmux            # session name: cc-main
-cc-tmux feature-x  # session name: feature-x
+herald-tmux            # session name: cc-main
+herald-tmux feature-x  # session name: feature-x
 ```
 
 The wrapper sets `CC_TMUX_TARGET` / `CC_TMUX_CONTAINER` env vars so the Notification hook knows where to send keystrokes back. If you skip the wrapper (i.e. just run `claude`), the hook silently no-ops — interactive Telegram notifications won't fire, but nothing breaks.
@@ -204,7 +204,7 @@ Tokens expire after `NOTIFY_TTL_SECONDS` (default: 1h) — taps on stale message
 
 ### Security note for interactive flow
 
-The buttons execute `docker exec <container> tmux send-keys` against your live session. Anyone who can reach `cc-bot:7788/notify` from inside your docker network can trigger a notify (no auth on the hook endpoint). The Telegram button → send-keys step is gated by your `ALLOWED_USERNAME` / `ALLOWED_USER_ID`, so a leaked notify token alone can't inject text. Threat model is the same as the rest of cc-bot: trusted infra, untrusted humans on the internet.
+The buttons execute `docker exec <container> tmux send-keys` against your live session. Anyone who can reach `herald:7788/notify` from inside your docker network can trigger a notify (no auth on the hook endpoint). The Telegram button → send-keys step is gated by your `ALLOWED_USERNAME` / `ALLOWED_USER_ID`, so a leaked notify token alone can't inject text. Threat model is the same as the rest of herald: trusted infra, untrusted humans on the internet.
 
 ## Security
 
@@ -214,7 +214,7 @@ If you need hard isolation:
 - Run the target container with read-only mounts where possible
 - Don't grant docker.sock to the target unless you need it
 - Use 🔒 Strict mode
-- Or run cc-bot only in non-production environments
+- Or run herald only in non-production environments
 
 ## Configuration
 

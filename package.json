@@ -1,5 +1,5 @@
 {
-  "name": "cc-bot",
+  "name": "herald",
   "version": "0.1.0",
   "description": "Drive Claude Code from your phone via Telegram. PR-friendly. Strict/Guided/Yolo approval modes.",
   "type": "module",
@@ -13,6 +13,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dustin-olenslager/cc-bot"
+    "url": "https://github.com/dustin-olenslager/herald"
   }
 }

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# cc-bot Notification hook
+# herald Notification hook
 # Fires when Claude Code is waiting for user input (idle, permission prompt, etc.)
-# Posts to cc-bot, which forwards to Telegram with buttons that send keystrokes
+# Posts to herald, which forwards to Telegram with buttons that send keystrokes
 # back into the tmux-hosted interactive session.
 #
 # Inert in non-tmux sessions and in bot-spawned sessions (avoids notify loops).
 
 set -euo pipefail
 
-# Skip bot-spawned sessions: cc-bot sets CC_BOT_CHAT_ID for its own claude -p runs.
-if [ -n "${CC_BOT_CHAT_ID:-}" ]; then exit 0; fi
+# Skip bot-spawned sessions: herald sets HERALD_CHAT_ID for its own claude -p runs.
+if [ -n "${HERALD_CHAT_ID:-}" ]; then exit 0; fi
 
 # Skip if not running in a tmux-tracked interactive session.
 TARGET="${CC_TMUX_TARGET:-}"
@@ -21,7 +21,7 @@ if [ -z "$CONTAINER" ]; then
   CONTAINER="$(hostname)"
 fi
 
-BOT_URL="${CC_BOT_URL:-http://cc-bot:7788}"
+BOT_URL="${HERALD_URL:-http://herald:7788}"
 
 PAYLOAD="$(cat)"
 
@@ -35,7 +35,7 @@ else
   CWD=""
 fi
 
-# chatId is resolved server-side from cc-bot state (single-user setup).
+# chatId is resolved server-side from herald state (single-user setup).
 REQ_JSON=$(jq -n \
   --arg message "$MSG" \
   --arg sessionId "$SESSION" \

@@ -1,8 +1,8 @@
 services:
-  cc-bot:
+  herald:
     build: .
-    image: cc-bot:local
-    container_name: cc-bot
+    image: herald:local
+    container_name: herald
     restart: unless-stopped
     init: true
     env_file: .env
@@ -10,14 +10,9 @@ services:
       - ./data:/data
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
-      - cc-bot-net
+      herald-net: {}
 
 networks:
-  cc-bot-net:
-    name: cc-bot-net
+  herald-net:
+    name: herald-net
     external: true
-# To connect your existing claude container to this network:
-#   docker network connect cc-bot-net <your-claude-container>
-# Or add it to your claude container's compose:
-#   networks: [cc-bot-net]
-#   external: true

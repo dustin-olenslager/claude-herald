@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # Launch (or attach to) an interactive Claude Code session inside tmux,
-# exposing the tmux target to the cc-bot Notification hook so the bot can
+# exposing the tmux target to the herald Notification hook so the bot can
 # inject keystrokes from Telegram.
 #
 # Usage:
-#   cc-tmux.sh                       # session name: cc-main
-#   cc-tmux.sh feature-x             # session name: feature-x
+#   herald-tmux.sh                       # session name: cc-main
+#   herald-tmux.sh feature-x             # session name: feature-x
 #
 # Env (auto-detected; override as needed):
 #   CC_TMUX_CONTAINER  Container hosting this tmux session (default: $(hostname))
-#   CC_BOT_URL         cc-bot HTTP base (default: http://cc-bot:7788)
+#   HERALD_URL         herald HTTP base (default: http://herald:7788)
 
 set -euo pipefail
 
 SESSION="${1:-cc-main}"
 CONTAINER="${CC_TMUX_CONTAINER:-$(hostname)}"
-BOT_URL="${CC_BOT_URL:-http://cc-bot:7788}"
+BOT_URL="${HERALD_URL:-http://herald:7788}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 
 if ! command -v tmux >/dev/null 2>&1; then
@@ -34,5 +34,5 @@ exec tmux new-session -A -s "$SESSION" \
   env \
     CC_TMUX_TARGET="$TARGET" \
     CC_TMUX_CONTAINER="$CONTAINER" \
-    CC_BOT_URL="$BOT_URL" \
+    HERALD_URL="$BOT_URL" \
     "$CLAUDE_BIN"

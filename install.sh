@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cc-bot interactive installer.
+# herald interactive installer.
 # Run from a fresh clone:  ./install.sh
 # Idempotent: re-running detects existing state and offers to reconfigure.
 
@@ -36,10 +36,10 @@ fi
 ok "docker compose present"
 
 if [ ! -f docker-compose.yml ] || [ ! -d src ]; then
-  err "Run this from the cc-bot repo root (where docker-compose.yml lives)."
+  err "Run this from the herald repo root (where docker-compose.yml lives)."
   exit 1
 fi
-ok "cc-bot repo detected"
+ok "herald repo detected"
 
 # ── 1. .env ───────────────────────────────────────────────────────
 hdr "Config (.env)"
@@ -119,11 +119,11 @@ else
   ask "Build a fresh one from examples/claude-container.Dockerfile? [Y/n]"
   read -r r; r="${r,,}"
   if [ -z "$r" ] || [ "$r" = "y" ] || [ "$r" = "yes" ]; then
-    docker build -t cc-bot-target:local -f examples/claude-container.Dockerfile examples/ >/dev/null
+    docker build -t herald-target:local -f examples/claude-container.Dockerfile examples/ >/dev/null
     docker run -d --name "$TARGET" --restart unless-stopped \
       -v "$(pwd)/workspace:/workspace" \
       -v /var/run/docker.sock:/var/run/docker.sock \
-      cc-bot-target:local
+      herald-target:local
     ok "Built and started '$TARGET'"
     warn "You must authenticate claude once before using the bot:"
     say "  docker exec -it -u cc $TARGET claude"
@@ -154,18 +154,18 @@ fi
 # ── 3. Network ────────────────────────────────────────────────────
 hdr "Network"
 
-if docker network inspect cc-bot-net >/dev/null 2>&1; then
-  ok "Network 'cc-bot-net' exists"
+if docker network inspect herald-net >/dev/null 2>&1; then
+  ok "Network 'herald-net' exists"
 else
-  docker network create cc-bot-net >/dev/null
-  ok "Created network 'cc-bot-net'"
+  docker network create herald-net >/dev/null
+  ok "Created network 'herald-net'"
 fi
 
-if docker inspect "$TARGET" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' | grep -q cc-bot-net; then
-  ok "'$TARGET' already on cc-bot-net"
+if docker inspect "$TARGET" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' | grep -q herald-net; then
+  ok "'$TARGET' already on herald-net"
 else
-  docker network connect cc-bot-net "$TARGET"
-  ok "Connected '$TARGET' to cc-bot-net"
+  docker network connect herald-net "$TARGET"
+  ok "Connected '$TARGET' to herald-net"
 fi
 
 # ── 4. Build + start ──────────────────────────────────────────────
@@ -173,11 +173,11 @@ hdr "Build + start"
 
 docker compose up -d --build 2>&1 | tail -3
 sleep 2
-if docker ps --format '{{.Names}}' | grep -q '^cc-bot$'; then
-  ok "cc-bot running"
+if docker ps --format '{{.Names}}' | grep -q '^herald$'; then
+  ok "herald running"
 else
-  err "cc-bot failed to start. Logs:"
-  docker logs cc-bot --tail 30
+  err "herald failed to start. Logs:"
+  docker logs herald --tail 30
   exit 1
 fi
 
@@ -193,6 +193,6 @@ else
   ok "Open Telegram → find your bot → send /start"
 fi
 say ""
-say "${C_DIM}Logs:  docker logs -f cc-bot${C_R}"
+say "${C_DIM}Logs:  docker logs -f herald${C_R}"
 say "${C_DIM}Stop:  docker compose down${C_R}"
 say "${C_DIM}Mode:  /settings in Telegram${C_R}"

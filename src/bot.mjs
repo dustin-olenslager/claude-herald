@@ -24,12 +24,12 @@ const BASH_DEFAULT_TIMEOUT_MS = process.env.CLAUDE_BASH_DEFAULT_TIMEOUT_MS || '3
 const BASH_MAX_TIMEOUT_MS = process.env.CLAUDE_BASH_MAX_TIMEOUT_MS || '3600000';
 const APPROVAL_PORT = Number(process.env.APPROVAL_PORT) || 7788;
 const HOOK_SRC = process.env.HOOK_SRC || '/app/hooks/pretooluse-gate.sh';
-const HOOK_PATH = process.env.HOOK_PATH || '/usr/local/bin/cc-bot-pretooluse-gate.sh';
+const HOOK_PATH = process.env.HOOK_PATH || '/usr/local/bin/herald-pretooluse-gate.sh';
 const NOTIFY_HOOK_SRC = process.env.NOTIFY_HOOK_SRC || '/app/hooks/notify-tg.sh';
-const NOTIFY_HOOK_PATH = process.env.NOTIFY_HOOK_PATH || '/usr/local/bin/cc-bot-notify-tg.sh';
-const TMUX_LAUNCHER_SRC = process.env.TMUX_LAUNCHER_SRC || '/app/hooks/cc-tmux.sh';
-const TMUX_LAUNCHER_PATH = process.env.TMUX_LAUNCHER_PATH || '/usr/local/bin/cc-tmux';
-const BOT_URL_FOR_HOOK = process.env.BOT_URL_FOR_HOOK || `http://cc-bot:${APPROVAL_PORT}`;
+const NOTIFY_HOOK_PATH = process.env.NOTIFY_HOOK_PATH || '/usr/local/bin/herald-notify-tg.sh';
+const TMUX_LAUNCHER_SRC = process.env.TMUX_LAUNCHER_SRC || '/app/hooks/herald-tmux.sh';
+const TMUX_LAUNCHER_PATH = process.env.TMUX_LAUNCHER_PATH || '/usr/local/bin/herald-tmux';
+const BOT_URL_FOR_HOOK = process.env.BOT_URL_FOR_HOOK || `http://herald:${APPROVAL_PORT}`;
 // Phalanx no-babysit: when an inline run leaves work unfinished, hand the repo to the
 // detached supervisor to finish across fresh sessions. Disable with PHALANX_AUTOESCALATE=0.
 const AUTO_ESCALATE = process.env.PHALANX_AUTOESCALATE !== '0';
@@ -109,7 +109,7 @@ async function downloadTgFile(fileId, ext = '.bin') {
   const res = await fetch(url);
   if (!res.ok) return { error: `download ${res.status}` };
   const buf = Buffer.from(await res.arrayBuffer());
-  const stem = `cc-bot-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;
+  const stem = `herald-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;
   const localPath = `/tmp/${stem}`;
   fs.writeFileSync(localPath, buf);
   // Copy into target container at the same path so claude can Read it.
@@ -364,9 +364,9 @@ function runClaude(prompt, chatId, sk, threadId) {
       'exec', '-i',
       '-u', TARGET_USER,
       '-w', cwd,
-      '-e', `CC_BOT_CHAT_ID=${chatId}`,
-      '-e', `CC_BOT_MODE=${mode}`,
-      '-e', `CC_BOT_URL=${BOT_URL_FOR_HOOK}`,
+      '-e', `HERALD_CHAT_ID=${chatId}`,
+      '-e', `HERALD_MODE=${mode}`,
+      '-e', `HERALD_URL=${BOT_URL_FOR_HOOK}`,
       '-e', `APPROVAL_TIMEOUT_SECONDS=${process.env.APPROVAL_TIMEOUT_SECONDS || 300}`,
       '-e', 'PATH=/home/cc/.npm-global/bin:/usr/local/bin:/usr/bin:/bin',
       '-e', `API_TIMEOUT_MS=${API_TIMEOUT_MS}`,
