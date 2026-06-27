@@ -1,27 +1,43 @@
-# herald
+# Herald
 
-**Drive Claude Code from your phone via Telegram.** PR-friendly. Strict / Guided / Yolo approval modes.
+<p>
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-ready-d97757">
+  <img alt="Telegram" src="https://img.shields.io/badge/Telegram-bot-229ED9?logo=telegram&logoColor=white">
+  <img alt="Docker" src="https://img.shields.io/badge/deploy-docker%20compose-2496ED?logo=docker&logoColor=white">
+  <img alt="self-hosted" src="https://img.shields.io/badge/self--hosted-no%20SaaS-22c55e">
+</p>
 
-Send a message → it runs in your Claude Code container. Get a short summary back with a 📖 Details button. Approve risky shell commands with a single tap. Review and merge PRs from your couch.
+**Drive Claude Code from your phone via Telegram.** Send a message → it runs in your
+own Claude Code container → you get a short summary back with a 📖 **Details** button.
+Approve risky shell commands with a single tap. Review and merge PRs from your couch.
+
+```
+You 📱  "fix the failing auth test and open a PR"
+Herald  ✅ Done — 1 file changed, tests green.  [📖 Details] [➡️ Continue] [⚙️ Settings]
+You 📱  /pr 124  →  [Review] [Approve] [Merge] [Open]
+```
 
 ## Why
 
-Claude Code is amazing at the keyboard. But the moments you most want an AI dev — standing in line, walking the dog, lying in bed at 11pm thinking about that one bug — you don't have a keyboard. herald fixes that.
+Claude Code is amazing at the keyboard. But the moments you most want an AI dev —
+standing in line, walking the dog, lying in bed at 11pm thinking about that one bug —
+you don't have a keyboard. Herald fixes that: your dev environment, in your pocket, with
+the approval guardrails you choose.
 
-## Features (v0.1)
+## Highlights
 
-- **Telegram-native UI.** Inline buttons, command autocomplete, summaries that fit your screen.
-- **Three approval modes:** 🔒 Strict (every edit) / ⚖️ Guided (only risky bash) / 🚀 Yolo (full autonomy). Switch in `/settings`.
-- **PR commands.** `/pr 123` to view, then tap to approve / merge. `/prs` for your open PRs.
-- **Real `/stop`.** Kills the running Claude process. No more waiting 10 minutes for a wrong turn.
-- **Summaries by default.** Claude is instructed to TL;DR every reply; full response sits behind a 📖 Details button.
-- **Self-host friendly.** One `docker compose up`. No SaaS, no proxy, your tokens stay yours.
-- **Telegram for *interactive* sessions too.** Wrap your terminal Claude in tmux and the bot will ping you on Telegram whenever Claude pauses for input — tap a number, hit Esc, or type a free-text reply. Keystrokes are piped straight into the live session.
+- 📱 **Telegram-native UI** — inline buttons, command autocomplete, screen-sized summaries.
+- ⚖️ **Three approval modes** — 🔒 Strict / ⚖️ Guided / 🚀 Yolo. Risky shell gated to a single tap.
+- 🔀 **PR from your couch** — `/pr 123` → view, approve, merge with buttons.
+- ⛔ **Real `/stop`** — kills the running Claude process instantly. No 10-minute wrong turns.
+- 🔌 **Self-host friendly** — one `docker compose up`. No SaaS, no proxy, your tokens stay yours.
+- 🪝 **Bridges live terminal sessions too** — wrap `claude` in tmux and get pinged when it pauses for input.
 
 ## Quickstart (2 minutes)
 
 ```bash
-git clone https://github.com/dustin-olenslager/herald.git
+git clone https://github.com/dustin-olenslager/claude-herald.git herald
 cd herald
 ./install.sh
 ```
@@ -51,7 +67,7 @@ Then open the printed Telegram link, send `/start`. You're driving.
 <summary>Click to expand</summary>
 
 ```bash
-git clone https://github.com/dustin-olenslager/herald.git
+git clone https://github.com/dustin-olenslager/claude-herald.git herald
 cd herald
 cp .env.example .env
 # edit .env: BOT_TOKEN, ALLOWED_USERNAME, TARGET_CONTAINER
