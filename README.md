@@ -160,6 +160,23 @@ Buttons under every reply: 📖 Details · ➡️ Continue · 🛑 Stop · 🆕 
 - Hook posts to bot's internal HTTP server. Bot sends inline approval buttons.
 - You tap → bot resolves → hook exits 0 → tool runs.
 
+## Works with Phalanx (autonomous loop from your phone)
+
+Herald is the **reference adapter** for [Phalanx](https://github.com/dustin-olenslager/claude-phalanx) —
+an always-on, hook-enforced pipeline + **no-babysit supervisor** for Claude Code. Send a
+request that won't finish in one session and Herald hands it to Phalanx's detached
+supervisor, which relaunches fresh `claude -p "/work"` passes until the backlog is green
+or `BLOCKED` — no human ever runs `/clear`.
+
+- Herald exposes `POST /event`, which implements Phalanx's notify **port**. When it
+  launches the supervisor it sets `PHALANX_NOTIFY_URL=<herald>/event`, so the loop's
+  `start`/`progress`/`done`/`blocked` events stream into your Telegram topic.
+- Unfinished inline runs **auto-escalate** to the supervisor by default
+  (`PHALANX_AUTOESCALATE=0` to disable).
+- Phalanx is **optional** — Herald drives a plain `claude -p` run just fine without it.
+  Install Phalanx in the target container to upgrade one-shot replies into a
+  self-continuing loop you can watch from your couch.
+
 ## Interactive sessions (Telegram-as-input-bridge)
 
 The default flow above is **bot-initiated**: you type in Telegram, the bot spawns a `claude -p` run, you get a reply.
