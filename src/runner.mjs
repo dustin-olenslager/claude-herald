@@ -3,6 +3,12 @@ import { TLDR_INSTRUCTION, splitTldr, costFooter } from './tldr.mjs';
 import { ASK_INSTRUCTION, parseAsk, stripAsk, detectYesNo, askKeyboard, nextAfterAnswer } from './ask-flow.mjs';
 import { log } from './log.mjs';
 
+// True when a `claude -p --resume <id>` failed because the session no longer
+// exists — the signal to drop the stored session and start fresh instead of erroring.
+export function isStaleSessionError(message) {
+  return /No conversation found with session ID/i.test(String(message || ''));
+}
+
 // Owns the docker-exec `claude -p` pass plus the run-lifecycle Maps:
 //   runningProcs  — sk -> { child, startedAt, stopRequested }
 //   askQueues     — sk -> { items, answers, idx }
@@ -146,7 +152,22 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
       tg.tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' }).catch(() => {});
     }, 4000);
     try {
-      const result = await runClaude(prompt, chatId, sk, threadId);
+      let result;
+      try {
+        result = await runClaude(prompt, chatId, sk, threadId);
+      } catch (e) {
+        // A stale/expired --resume id hard-fails with "No conversation found with
+        // session ID". Don't error the user out of the topic — drop the dead session
+        // and retry once as a FRESH session (no --resume).
+        if (isStaleSessionError(e?.message) && state.getSession(sk)) {
+          log.warn({ sk, chatId, msg: 'stale session id — clearing, retrying fresh' });
+          state.clearSession(sk);
+          await tg.sendChunked(chatId, '↻ Previous session expired — starting fresh.', { threadId }).catch(() => {});
+          result = await runClaude(prompt, chatId, sk, threadId);
+        } else {
+          throw e;
+        }
+      }
       state.setSession(sk, result.session_id);
       const body = result.result ?? JSON.stringify(result, null, 2);
       const { tldr, details } = splitTldr(body);
