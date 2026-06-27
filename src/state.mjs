@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 const STATE_FILE = process.env.STATE_FILE || '/data/state.json';
 
@@ -11,6 +12,7 @@ const DEFAULT_STATE = {
   repos: {},          // chatId -> current working repo path
   topics: {},         // `${chatId}:${name}` -> forum topic message_thread_id (0 = flat / not a forum)
   knownUserId: null,
+  hookSecret: null,   // shared secret authing the HTTP boundary (hooks/supervisor/cron)
 };
 
 let state = { ...DEFAULT_STATE };
@@ -91,6 +93,21 @@ export function getTopic(chatId, name) {
 export function setTopic(chatId, name, threadId) {
   state.topics[`${chatId}:${name}`] = threadId;
   save();
+}
+
+// Shared secret authing /approve, /notify, /event and read by the host watch-cron
+// from state.json. Env override wins; otherwise generate-once and persist so it
+// survives restarts. crypto.timingSafeEqual is used at the boundary, not here.
+export function getHookSecret() {
+  return process.env.HERALD_HOOK_SECRET || state.hookSecret || null;
+}
+
+export function ensureHookSecret() {
+  const existing = getHookSecret();
+  if (existing) return existing;
+  state.hookSecret = crypto.randomBytes(24).toString('hex');
+  save();
+  return state.hookSecret;
 }
 
 // The forum supergroup's chat id (negative), learned from the first topic message.

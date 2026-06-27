@@ -47,6 +47,7 @@ REQ_JSON=$(jq -n \
 curl -sS -m 10 \
   -X POST \
   -H 'Content-Type: application/json' \
+  -H "x-herald-secret: ${HERALD_HOOK_SECRET:-}" \
   -d "$REQ_JSON" \
   "$BOT_URL/notify" >/dev/null 2>&1 || true
 

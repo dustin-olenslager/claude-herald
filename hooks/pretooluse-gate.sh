@@ -50,6 +50,12 @@ case "$TOOL" in
     if printf '%s' "$CMD" | grep -qE '(^|[[:space:]])(deploy|release)([[:space:]]|$|\.sh)'; then needs_approval=1; fi
     if printf '%s' "$CMD" | grep -qiE 'psql.*(DROP|DELETE|TRUNCATE)'; then needs_approval=1; fi
     if printf '%s' "$CMD" | grep -qE 'sudo[[:space:]]'; then needs_approval=1; fi
+    # Code-execution / obfuscation vectors gated in BOTH strict and guided.
+    if printf '%s' "$CMD" | grep -qE '(^|[[:space:]])eval([[:space:]]|$)'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE '(bash|sh)[[:space:]]+-c([[:space:]]|$)'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE 'curl[[:space:]].*\|[[:space:]]*(bash|sh)'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE '(^|[[:space:]])base64([[:space:]]|$)'; then needs_approval=1; fi
+    if printf '%s' "$CMD" | grep -qE 'python[0-9.]*[[:space:]]+-c([[:space:]]|$)'; then needs_approval=1; fi
     # strict: ALSO any write redirection or curl|bash
     if [ "$MODE" = "strict" ]; then
       if printf '%s' "$CMD" | grep -qE '(>|>>)[[:space:]]*[^|]'; then needs_approval=1; fi
@@ -77,6 +83,7 @@ HTTP_CODE=$(curl -sS -o /tmp/herald-approval-resp.$$ -w "%{http_code}" \
   --max-time "$((${APPROVAL_TIMEOUT_SECONDS:-300} + 10))" \
   -X POST \
   -H 'Content-Type: application/json' \
+  -H "x-herald-secret: ${HERALD_HOOK_SECRET:-}" \
   -d "$REQ_JSON" \
   "$BOT_URL/approve" 2>/dev/null || echo "000")
 

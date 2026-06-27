@@ -120,13 +120,30 @@ async function handleEvent(req, res) {
   }
 }
 
-export function start() {
+// Constant-time secret check. Length-guard first (timingSafeEqual throws on
+// length mismatch). Bound to 0.0.0.0 cross-container, so the secret IS the auth.
+function authOk(req, secret) {
+  const got = req.headers['x-herald-secret'];
+  if (!secret || typeof got !== 'string') return false;
+  const a = Buffer.from(got);
+  const b = Buffer.from(secret);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+export function start(secret) {
   const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST') {
       res.writeHead(405).end('method not allowed');
       return;
     }
     const path = (req.url || '').split('?')[0];
+    if (path === '/approve' || path === '/notify' || path === '/event') {
+      if (!authOk(req, secret)) {
+        res.writeHead(401).end('unauthorized');
+        return;
+      }
+    }
     if (path === '/approve') return handleApprove(req, res);
     if (path === '/notify') return handleNotify(req, res);
     if (path === '/event') return handleEvent(req, res);

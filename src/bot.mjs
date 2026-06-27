@@ -40,7 +40,14 @@ if (!ALLOWED_USERNAME && !ALLOWED_USER_ID) { console.error('ALLOWED_USERNAME or 
 
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
+// Shared HTTP-boundary secret (persisted in state.json; readable by the host cron).
+const HOOK_SECRET = state.ensureHookSecret();
+
 const runningProcs = new Map(); // sk -> { child, startedAt }
+
+// Only targets matching herald-tmux.sh's scheme (<session>:0.0) may receive
+// send-keys, so a rogue /notify caller can't aim keystrokes at an arbitrary pane.
+const TMUX_TARGET_RE = /^[A-Za-z0-9_.-]+:0\.0$/;
 
 // Scope key: each forum topic (message_thread_id) is its own independent session.
 // Non-forum / General topic (no threadId) keeps today's flat per-chat scope.
@@ -276,7 +283,12 @@ async function advanceAsk(chatId, sk, threadId) {
 // Send keystrokes into an interactive Claude session running in tmux inside a container.
 // `text` is appended with Enter unless it's the literal sentinel 'ESC' (sent as Escape key).
 async function sendTmuxKeys(container, target, text) {
-  const args = ['exec', '-u', TARGET_USER, container, 'tmux', 'send-keys', '-t', target];
+  // Pin the container — never trust a client-supplied one — and validate the
+  // target against the known herald-tmux scheme before injecting keystrokes.
+  if (!TMUX_TARGET_RE.test(String(target || ''))) {
+    throw new Error(`refusing send-keys to unknown tmux target: ${target}`);
+  }
+  const args = ['exec', '-u', TARGET_USER, TARGET_CONTAINER, 'tmux', 'send-keys', '-t', target];
   if (text === 'ESC') {
     args.push('Escape');
   } else {
@@ -305,6 +317,7 @@ async function launchSupervisor(cwd, chatId) {
   const notifyUrl = `${BOT_URL_FOR_HOOK}/event${chatId ? `?chatId=${chatId}` : ''}`;
   await execFileP('docker', ['exec', '-u', TARGET_USER,
     '-e', `PHALANX_NOTIFY_URL=${notifyUrl}`,
+    '-e', `PHALANX_NOTIFY_SECRET=${HOOK_SECRET}`,
     '-e', 'PATH=/home/cc/.npm-global/bin:/usr/local/bin:/usr/bin:/bin',
     TARGET_CONTAINER, 'bash', SUPERVISORD_PATH, 'start', '-r', cwd]);
 }
@@ -367,6 +380,7 @@ function runClaude(prompt, chatId, sk, threadId) {
       '-e', `HERALD_CHAT_ID=${chatId}`,
       '-e', `HERALD_MODE=${mode}`,
       '-e', `HERALD_URL=${BOT_URL_FOR_HOOK}`,
+      '-e', `HERALD_HOOK_SECRET=${HOOK_SECRET}`,
       '-e', `APPROVAL_TIMEOUT_SECONDS=${process.env.APPROVAL_TIMEOUT_SECONDS || 300}`,
       '-e', 'PATH=/home/cc/.npm-global/bin:/usr/local/bin:/usr/bin:/bin',
       '-e', `API_TIMEOUT_MS=${API_TIMEOUT_MS}`,
@@ -920,7 +934,7 @@ let offset = 0;
 async function pollLoop() {
   console.log(`herald up; allowed=@${ALLOWED_USERNAME || ALLOWED_USER_ID} target=${TARGET_CONTAINER} (user=${TARGET_USER})`);
   registerCommands();
-  approval.start();
+  approval.start(HOOK_SECRET);
   ensureHook();
   const allowed = encodeURIComponent(JSON.stringify(['message', 'callback_query']));
   while (true) {
