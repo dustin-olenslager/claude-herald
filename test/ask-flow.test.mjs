@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAsk, stripAsk, detectYesNo, nextAfterAnswer, hardStopAsk, runHardStopAsk } from '../src/ask-flow.mjs';
+import { parseAsk, stripAsk, detectYesNo, nextAfterAnswer, hardStopAsk, runHardStopAsk, hasContinue, stripContinue } from '../src/ask-flow.mjs';
 
 test('parseAsk: single valid block', () => {
   const r = parseAsk('summary\n<<ASK>>\n[{"q":"Drop or rename?","opts":["drop","rename"]}]\n<<END>>');
@@ -106,4 +106,18 @@ test('runHardStopAsk: timeout vs error option sets', () => {
   assert.match(runHardStopAsk('timeout')[0].q, /timed out/i);
   assert.ok(runHardStopAsk('timeout')[0].opts.includes('Resume / continue'));
   assert.ok(runHardStopAsk('error')[0].opts.includes('Retry'));
+});
+
+test('hasContinue: marker present → true, absent → false', () => {
+  assert.equal(hasContinue('Phase 3 shipped.\n<<CONTINUE>>'), true);
+  assert.equal(hasContinue('Phase 3 shipped. Next?'), false);
+});
+
+test('stripContinue: removes marker and trims', () => {
+  assert.equal(stripContinue('Phase 3 shipped.\n<<CONTINUE>>'), 'Phase 3 shipped.');
+});
+
+test('hardStopAsk wins over continue is caller-ordered (BLOCKED still detected with marker)', () => {
+  // A reply can carry both; runner checks hardStopAsk BEFORE hasContinue.
+  assert.ok(hardStopAsk('BLOCKED: needs sign-off\n<<CONTINUE>>'));
 });

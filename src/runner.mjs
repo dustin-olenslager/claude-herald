@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { TLDR_INSTRUCTION, splitTldr, costFooter } from './tldr.mjs';
-import { ASK_INSTRUCTION, parseAsk, stripAsk, detectYesNo, askKeyboard, nextAfterAnswer, hardStopAsk, runHardStopAsk } from './ask-flow.mjs';
+import { ASK_INSTRUCTION, CONTINUE_INSTRUCTION, parseAsk, stripAsk, detectYesNo, askKeyboard, nextAfterAnswer, hardStopAsk, runHardStopAsk, hasContinue, stripContinue } from './ask-flow.mjs';
 import { log } from './log.mjs';
 
 // Phalanx PreToolUse safety gates installed in the target container's ~/.claude.
@@ -75,7 +75,7 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
         '-p',
         '--output-format', 'json',
         '--model', model,
-        '--append-system-prompt', `${TLDR_INSTRUCTION}\n\n${ASK_INSTRUCTION}`,
+        '--append-system-prompt', `${TLDR_INSTRUCTION}\n\n${ASK_INSTRUCTION}\n\n${CONTINUE_INSTRUCTION}`,
       ];
       if (sessionId) claudeArgs.push('--resume', sessionId);
 
@@ -202,6 +202,15 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
         await tg.sendChunked(chatId, tldr, { threadId });
         return startAskQueue(chatId, sk, threadId, hs);
       }
+      // Agent signalled more work + not blocked (<<CONTINUE>>) → drive the rest
+      // autonomously instead of asking "Next?". Falls back to a manual Continue if the
+      // supervisor is disabled or fails to launch.
+      if (hasContinue(body)) {
+        const clean = stripContinue(tldr);
+        if (clean) await tg.sendChunked(chatId, clean, { threadId });
+        if (await supervisor.continueAutonomously(chatId, sk, threadId, defaultKeyboard)) return;
+        return tg.sendChunked(chatId, '↪️ Tap Continue to keep going.', { markup: defaultKeyboard(sk), threadId });
+      }
       const markup = detectYesNo(tldr) ? questionKeyboard(sk) : defaultKeyboard(sk);
       await tg.sendChunked(chatId, tldr + costFooter(result, state.getModel(sk)), { markup, threadId });
       // No success-path escalation: a normal completed turn must NOT hand the repo to the
@@ -221,8 +230,10 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
         else summary = `⚠️ Claude errored. Tap 📖 Details for full trace.`;
         state.setLastResponse(sk, { tldr: summary, details: full, model: state.getModel(sk) });
         await tg.sendChunked(chatId, summary, { threadId });
-        // Run-level hard stop → ALWAYS a selectable decision (operator chooses; replaces
-        // the silent auto-escalate, which the no-text-wall rule forbids).
+        // Timeout = unfinished work, not a decision → auto-continue via the supervisor.
+        // Error = a real failure → selectable decision. Timeout falls back to the question
+        // if auto-continue is disabled or the launch fails.
+        if (isTimeout && await supervisor.continueAutonomously(chatId, sk, threadId, defaultKeyboard)) return;
         return startAskQueue(chatId, sk, threadId, runHardStopAsk(isTimeout ? 'timeout' : 'error'));
       }
     } finally {

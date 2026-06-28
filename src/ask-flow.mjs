@@ -9,6 +9,19 @@ export const ASK_INSTRUCTION = `When you are blocked and need the operator to ma
 <<END>>
 One object per decision, 2-4 short opts each. Only emit it when genuinely blocked on the operator.`;
 
+// Tells the agent to KEEP GOING across phases instead of asking "Next?". When a unit of
+// work finishes and a clear next step remains (and it's not blocked), it emits <<CONTINUE>>
+// and the runner hands the rest to the autonomous supervisor — no per-phase babysitting.
+export const CONTINUE_INSTRUCTION = `When you finish a unit of work (a phase or task) and a clear NEXT step remains in the SAME plan, and you are NOT blocked on an operator decision: do NOT ask "what's next" or stop for confirmation. End your reply with the marker <<CONTINUE>> on its own line — the system continues automatically in a fresh pass. Reserve <<ASK>> for when you genuinely need the operator to choose.`;
+
+export function hasContinue(text) {
+  return /<<CONTINUE>>/.test(text || '');
+}
+
+export function stripContinue(text) {
+  return (text || '').replace(/<<CONTINUE>>/g, '').trim();
+}
+
 export function parseAsk(text) {
   const m = (text || '').match(/<<ASK>>\s*([\s\S]*?)\s*<<END>>/);
   if (!m) return null;

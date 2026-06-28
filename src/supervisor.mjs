@@ -44,5 +44,24 @@ export function makeSupervisor({ exec, state, tg, deps }) {
     return true;
   }
 
-  return { launchSupervisor, maybeEscalate };
+  // Success-path continuation: the agent finished a unit but signalled more work remains
+  // (<<CONTINUE>>) or a run timed out mid-work. Launch the supervisor to drive the rest to
+  // done across fresh passes — no "Next?" prompt. Unlike maybeEscalate this does NOT gate on
+  // repoHasOpenTasks (the agent explicitly declared more work). Returns false if disabled or
+  // the launch failed, so the caller can fall back to a normal reply / selectable question.
+  async function continueAutonomously(chatId, sk, threadId, defaultKeyboard) {
+    if (!AUTO_ESCALATE) return false;
+    const cwd = state.getRepo(sk);
+    try { await launchSupervisor(cwd, chatId, threadId); }
+    catch (e) {
+      log.error({ chatId, cwd, err: String(e?.message || e), msg: 'continueAutonomously launch failed' });
+      return false;
+    }
+    await tg.sendChunked(chatId,
+      '▶️ More to do — continuing autonomously across fresh passes. I\'ll message you on progress / done / blocked.',
+      { markup: defaultKeyboard(sk), threadId });
+    return true;
+  }
+
+  return { launchSupervisor, maybeEscalate, continueAutonomously };
 }
