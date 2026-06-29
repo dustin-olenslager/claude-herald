@@ -3,11 +3,14 @@
 
 // The agent emits <<ASK>>[{q,opts[]}]<<END>> when blocked on the operator; we ask
 // one question at a time with numbered buttons, collect, then resume the session.
-export const ASK_INSTRUCTION = `When you are blocked and need the operator to make one or more decisions, end your reply with a single machine-readable block (and a short human summary BEFORE it):
+export const ASK_INSTRUCTION = `When you need the operator to make ANY decision or choice — an approval, a which-way, a proceed-or-change, picking among paths — do NOT ask it in prose and do NOT fall back to a bare Yes/No. End your reply with a short human summary, THEN a single machine-readable block:
 <<ASK>>
-[{"q":"<question>","opts":["<choice 1>","<choice 2>"]}]
+[{"q":"<the decision>","opts":["<specific action>","<specific action>","<specific action>"]}]
 <<END>>
-One object per decision, 2-4 short opts each. Only emit it when genuinely blocked on the operator.`;
+SMART options (this is the point): each opt is a CONCRETE, DISTINCT action labeled by what it DOES, not a generic yes/no. Cover the real branches the operator would actually pick, including their consequence. 2-4 opts per decision, one object per decision.
+- Good: ["Approve all 4 ADRs — start Phase 2", "Revise ADR-0007 first", "Walk me through them before I decide"]
+- Bad: ["Yes", "No"]   ← only acceptable when the choice is genuinely binary with no middle option.
+If you catch yourself writing a "?" to the operator, convert that question into an <<ASK>> block with real options instead. Use it only when you genuinely need the operator to choose (otherwise emit <<CONTINUE>> and keep working).`;
 
 // Tells the agent to KEEP GOING across phases instead of asking "Next?". When a unit of
 // work finishes and a clear next step remains (and it's not blocked), it emits <<CONTINUE>>
