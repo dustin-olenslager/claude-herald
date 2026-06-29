@@ -9,6 +9,10 @@ import { log } from './log.mjs';
 // vanish for Telegram-driven agents. Deny wins across hooks, so they still block even in
 // yolo mode. Override via deps.PHALANX_GATE_FILES (e.g. [] in tests).
 const PHALANX_GATE_FILES = ['pipeline-gate.js', 'effect-ca-gate.js', 'secret-gate.js', 'loop-integrity-gate.js'];
+// PostToolUse advisory hook: the ceiling detector. Telegram passes must run it so a
+// one-shot run that fills context emits <<CONTINUE>> (-> supervisor hand-off) instead of
+// dead-ending. Override via deps.CTX_BUDGET_HOOK ('' in tests to disable).
+const CTX_BUDGET_HOOK = 'context-budget.js';
 
 // True when a `claude -p --resume <id>` failed because the session no longer
 // exists — the signal to drop the stored session and start fresh instead of erroring.
@@ -91,6 +95,15 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
             ...(phalanxGates.length
               ? [{ matcher: 'Skill|Bash|Edit|Write|MultiEdit|NotebookEdit', hooks: phalanxGates }]
               : []),
+          ],
+          // Context-budget (PostToolUse): without this the ceiling hook never runs in a
+          // Telegram pass, so a one-shot run that fills its context just stops dead instead
+          // of emitting <<CONTINUE>> -> the agent dead-ends at the ceiling with no hand-off.
+          // The hook is advisory (never blocks a tool); on a one-shot ceiling it tells the
+          // agent to checkpoint + emit <<CONTINUE>>, which continueAutonomously turns into a
+          // detached-supervisor hand-off that finishes the work across fresh passes.
+          PostToolUse: [
+            { matcher: '', hooks: [{ type: 'command', command: `node "$HOME/.claude/${deps.CTX_BUDGET_HOOK ?? CTX_BUDGET_HOOK}"` }] },
           ],
         },
       };
