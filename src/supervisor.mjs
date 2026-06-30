@@ -9,6 +9,10 @@ export function makeSupervisor({ exec, state, tg, deps }) {
   // until backlog done/BLOCKED, posting status to our /event endpoint. Idempotent:
   // supervisord refuses a second one.
   async function launchSupervisor(cwd, chatId, threadId) {
+    if (await exec.repoIsBlocked(cwd)) {
+      log.info({ chatId, cwd, msg: 'launchSupervisor: repo blocked/off, skipping' });
+      return;
+    }
     log.info({ chatId, threadId, cwd, msg: 'launchSupervisor attempt' });
     const q = new URLSearchParams();
     if (chatId) q.set('chatId', String(chatId));

@@ -47,6 +47,15 @@ export function makeContainerExec({ container, user }) {
     } catch { return false; } // exit 1 (no open tasks) or no TASKS.md
   }
 
+  // True if the repo has a BLOCKED sentinel or local .work-off kill switch.
+  async function repoIsBlocked(cwd) {
+    try {
+      await execFileP('docker', ['exec', '-u', user, container, 'bash', '-c',
+        '[ -f "$1/.claude-runs/BLOCKED" ] || [ -f "$1/.work-off" ]', '_', cwd]);
+      return true;
+    } catch { return false; }
+  }
+
   // True if `dir` is an existing directory in the target container. `dir` is passed
   // as an argv element (never interpolated into the shell) so a hostile path can't
   // break out of the `test -d` check.
@@ -72,5 +81,5 @@ export function makeContainerExec({ container, user }) {
     } catch { return []; }
   }
 
-  return { container, user, copyFileToContainer, copyAndChmod, sendTmuxKeys, repoHasOpenTasks, dirExists, listRepoCandidates, execFileP };
+  return { container, user, copyFileToContainer, copyAndChmod, sendTmuxKeys, repoHasOpenTasks, repoIsBlocked, dirExists, listRepoCandidates, execFileP };
 }
