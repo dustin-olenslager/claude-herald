@@ -41,6 +41,11 @@ test('parseAsk: coerces non-string q/opts to strings', () => {
   assert.deepEqual(r, [{ q: '123', opts: ['1', '2'] }]);
 });
 
+test('parseAsk: coerces {label,description} option objects to their label (no [object Object])', () => {
+  const r = parseAsk('<<ASK>>[{"q":"Fonto storage?","opts":[{"label":"Plan A wins","description":"Fonto owns bytes"},{"label":"D7 vendored wins"}]}]<<END>>');
+  assert.deepEqual(r, [{ q: 'Fonto storage?', opts: ['Plan A wins', 'D7 vendored wins'] }]);
+});
+
 test('stripAsk: removes the block and trims', () => {
   assert.equal(stripAsk('hello\n<<ASK>>[{"q":"x","opts":["a"]}]<<END>>'), 'hello');
 });
