@@ -25,6 +25,14 @@ export function stripContinue(text) {
   return (text || '').replace(/<<CONTINUE>>/g, '').trim();
 }
 
+// An opt may arrive as a bare string (documented shape) OR as an AskUserQuestion-style
+// object {label, description} — agents emit the latter from habit. Render the action
+// label; never let String({}) leak "[object Object]" onto a button.
+function optText(o) {
+  if (o && typeof o === 'object') return String(o.label ?? o.text ?? o.title ?? JSON.stringify(o));
+  return String(o);
+}
+
 export function parseAsk(text) {
   const m = (text || '').match(/<<ASK>>\s*([\s\S]*?)\s*<<END>>/);
   if (!m) return null;
@@ -33,7 +41,7 @@ export function parseAsk(text) {
     if (!Array.isArray(arr)) return null;
     return arr
       .filter((x) => x && x.q && Array.isArray(x.opts) && x.opts.length)
-      .map((x) => ({ q: String(x.q), opts: x.opts.slice(0, 4).map(String) }));
+      .map((x) => ({ q: String(x.q), opts: x.opts.slice(0, 4).map(optText) }));
   } catch { return null; }
 }
 
