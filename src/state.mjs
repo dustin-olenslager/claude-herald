@@ -14,6 +14,9 @@ const DEFAULT_STATE = {
   topics: {},         // `${chatId}:${name}` -> forum topic message_thread_id (0 = flat / not a forum)
   knownUserId: null,
   hookSecret: null,   // shared secret authing the HTTP boundary (hooks/supervisor/cron)
+  askQueues: {},      // sk -> { items, answers, idx } — pending ASK queue, persisted so a
+                      // bot restart (deploy/crash) doesn't kill in-flight question buttons
+  askPendingOther: {},// sk -> idx awaiting a typed custom answer
 };
 
 let state = { ...DEFAULT_STATE };
@@ -36,6 +39,18 @@ export function save() {
   const tmp = STATE_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
   fs.renameSync(tmp, STATE_FILE);
+}
+
+// Pending ASK-queue persistence: the runner keeps the working Maps in memory but
+// mirrors them here after each mutation, so a restart rehydrates in-flight questions
+// (otherwise their inline buttons go dead silently). Plain JSON — no framework types.
+export function getAskState() {
+  return { queues: { ...state.askQueues }, pending: { ...state.askPendingOther } };
+}
+export function setAskState(queues, pending) {
+  state.askQueues = queues;
+  state.askPendingOther = pending;
+  save();
 }
 
 export function getMode(chatId) {

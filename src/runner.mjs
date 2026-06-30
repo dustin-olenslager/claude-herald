@@ -32,6 +32,15 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
   const runningProcs = new Map();
   const askQueues = new Map();
   const askPendingOther = new Map();
+  // Rehydrate pending ASK queues from persisted state so a restart (deploy/crash)
+  // doesn't silently kill in-flight question buttons. runningProcs are NOT persisted
+  // (live child procs die with the process).
+  { const a = state.getAskState();
+    for (const [k, v] of Object.entries(a.queues)) askQueues.set(k, v);
+    for (const [k, v] of Object.entries(a.pending)) askPendingOther.set(k, v); }
+  function persistAsk() {
+    state.setAskState(Object.fromEntries(askQueues), Object.fromEntries(askPendingOther));
+  }
 
   function isRunning(sk) { return runningProcs.has(sk); }
   function getProc(sk) { return runningProcs.get(sk); }
@@ -40,8 +49,8 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
 
   function getAsk(sk) { return askQueues.get(sk); }
   function hasPendingOther(sk) { return askPendingOther.has(sk); }
-  function takePendingOther(sk) { const i = askPendingOther.get(sk); askPendingOther.delete(sk); return i; }
-  function setPendingOther(sk, idx) { askPendingOther.set(sk, idx); }
+  function takePendingOther(sk) { const i = askPendingOther.get(sk); askPendingOther.delete(sk); persistAsk(); return i; }
+  function setPendingOther(sk, idx) { askPendingOther.set(sk, idx); persistAsk(); }
 
   async function presentAsk(chatId, sk, threadId) {
     const q = askQueues.get(sk);
@@ -52,6 +61,7 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
 
   function startAskQueue(chatId, sk, threadId, items) {
     askQueues.set(sk, { items, answers: [], idx: 0 });
+    persistAsk();
     return presentAsk(chatId, sk, threadId);
   }
 
@@ -61,9 +71,11 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
     const decision = nextAfterAnswer(q);
     if (decision.kind === 'present') {
       q.idx = decision.idx;
+      persistAsk();
       return presentAsk(chatId, sk, threadId);
     }
     askQueues.delete(sk);
+    persistAsk();
     await tg.sendChunked(chatId, `Got it:\n${decision.compiled}`, { threadId });
     return runAndSend(chatId, `My decisions:\n${decision.compiled}`, sk, threadId);
   }
@@ -176,7 +188,7 @@ export function makeRunner({ exec, state, tg, supervisor, keyboards, ensureHook,
     }
     runningProcs.set(sk, { startedAt: Date.now() });
     await ensureHook();
-    askQueues.delete(sk); askPendingOther.delete(sk);
+    askQueues.delete(sk); askPendingOther.delete(sk); persistAsk();
     await tg.tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' });
     const heartbeat = setInterval(() => {
       tg.tg('sendChatAction', { chat_id: chatId, message_thread_id: threadId || undefined, action: 'typing' }).catch(() => {});

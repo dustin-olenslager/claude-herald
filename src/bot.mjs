@@ -471,8 +471,8 @@ async function handleCallback(cb) {
     }
     case 'ask': {
       const q = runner.getAsk(sk);
-      if (!q) return;
-      if (ev.idx !== q.idx) return;
+      if (!q) return sendChunked(chatId, '⚠️ That question expired (the bot restarted). Re-run your request, or just type your answer.', { threadId });
+      if (ev.idx !== q.idx) return sendChunked(chatId, '⚠️ That was an earlier question — answer the latest one above.', { threadId });
       if (ev.pick === 'x') {
         runner.setPendingOther(sk, ev.idx);
         await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '✏️ type your answer…', callback_data: 'noop' }]] } });
