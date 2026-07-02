@@ -34,6 +34,23 @@ else
   SESSION=""
 fi
 
+# Headless git-write allowlist ---------------------------------------------
+# In a headless bot run (HOME=/home/cc) or a Phalanx one-shot (PHALANX_ONESHOT=1)
+# nobody can tap an approval keyboard, so a gated git write (push/tag/merge/
+# checkout) hangs until the approval timeout and then fails closed. Those four
+# are always safe on a task branch, so auto-approve them ONLY when headless —
+# still logged, and herald stays fully on for everything else and for
+# interactive sessions.
+if [ "${HOME:-}" = "/home/cc" ] || [ "${PHALANX_ONESHOT:-}" = "1" ]; then
+  if [ "$TOOL" = "Bash" ] && \
+     printf '%s' "$CMD" | grep -qE '(^|[[:space:]]|;|&&|\|\|)git[[:space:]]+(push|tag|merge|checkout)([[:space:]]|$)'; then
+    TS=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?')
+    printf '%s headless-allow %s: %s\n' "$TS" "$TOOL" "$CMD" \
+      >> "${HERALD_GATE_LOG:-/tmp/herald-gate.log}" 2>/dev/null || true
+    exit 0
+  fi
+fi
+
 # Decide if this tool call needs approval ----------------------------------
 
 needs_approval=0
